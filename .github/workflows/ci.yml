@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [n72]
+  pull_request:
+    branches: [n72]
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi bc bison flex libssl-dev make
+      - name: Build apple_n72_defconfig zImage & dtbs
+        run: |
+          mkdir -p out
+          make O=out ARCH=arm CROSS_COMPILE=arm-none-eabi- apple_n72_defconfig
+          make O=out ARCH=arm CROSS_COMPILE=arm-none-eabi- -j$(nproc) zImage dtbs
+          make O=out ARCH=arm INSTALL_HDR_PATH=out/usr headers_install
+          test -f out/arch/arm/boot/zImage
+          test -f out/arch/arm/boot/dts/samsung/s5l8720-n72.dtb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-n72
+          path: |
+            out/arch/arm/boot/zImage
+            out/arch/arm/boot/dts/samsung/s5l8720-n72.dtb
