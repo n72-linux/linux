@@ -1079,6 +1079,16 @@ config MSC313E_WATCHDOG
 	  To compile this driver as a module, choose M here: the
 	  module will be called msc313e_wdt.
 
+config S5L8720_WATCHDOG
+	tristate "Samsung S5L8720 watchdog (iPod touch 2G)"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	depends on MFD_SYSCON
+	select WATCHDOG_CORE
+	help
+	  The watchdog of the S5L8720. The hardware has to be restarted
+	  about four times a second, which the kernel does itself while
+	  user space keeps /dev/watchdog alive.
+
 config APPLE_WATCHDOG
 	tristate "Apple SoC watchdog"
 	depends on ARCH_APPLE || COMPILE_TEST

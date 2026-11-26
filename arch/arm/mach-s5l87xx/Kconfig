@@ -13,6 +13,17 @@ config CPU_S5L8702
 	  Enable support for the Samsung/Apple S5L8702 SoC (ARM926EJ-S),
 	  as found in the iPod nano 3rd Generation (N46).
 
+config CPU_S5L8720
+	bool "Enable S5L8720 (iPod touch 2nd Generation / N72) CPU support"
+	select ARCH_MULTI_V6
+	select ARM_AMBA
+	select ARM_VIC
+	select CPU_IDLE
+	help
+	  Enable support for the Samsung/Apple S5L8720 SoC (ARM1176JZF-S),
+	  as found in the iPod touch 2nd generation (N72) and the iPod nano
+	  4th generation (N58).
+
 config CPU_S5L8723
 	bool "Enable S5L8723 (iPod nano 6th Generation / N20) CPU support"
 	select ARCH_MULTI_V6

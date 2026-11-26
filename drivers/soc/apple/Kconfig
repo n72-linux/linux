@@ -44,3 +44,16 @@ config APPLE_SART
 endmenu
 
 endif
+
+config APPLE_N72_COREV
+	bool "iPod touch 2G low core voltage state"
+	depends on CPU_S5L8720 || COMPILE_TEST
+	depends on PM_SLEEP && REGULATOR
+	default CPU_S5L8720
+	help
+	  Run the S5L8720's core at 1.05 V with the system clock divided by
+	  2 while the display is off and there is no USB power, as iOS
+	  does, and at 1.20 V otherwise and across every sleep, restart
+	  and kexec. The rail is the PMU's DOWN0 regulator.
+
+	  Say Y for the iPod touch 2nd generation (N72).

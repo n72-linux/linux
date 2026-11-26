@@ -14,6 +14,7 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/sched_clock.h>
+#include <linux/delay.h>
 
 #define TIMER_E     0xA0
 
@@ -37,6 +38,7 @@
 
 #define TM64_CNTH	 0x00
 #define TM64_CNTL	 0x04
+#define TM64_CTRL	 0x08
 
 
 #define S5L8720_TIMERE_RATE  1000000
@@ -131,11 +133,49 @@ static struct clock_event_device s5l8720_clockevent = {
 	.rating			= 300,
 };
 
+/* Start TIMER64 if it is not counting, at boot and after deep sleep. */
+static void s5l8720_timer64_start(struct s5l8720_tcu *tcu)
+{
+	if (s5l8720_clocksource_read(NULL) != s5l8720_clocksource_read(NULL))
+		return;
+	udelay(10);
+	if (s5l8720_clocksource_read(NULL) != s5l8720_clocksource_read(NULL))
+		return;
+	writel(0xa, tcu->base + TIMER_64 + TM64_CTRL);
+	writel(0xffffffff, tcu->base + TIMER_64 + 0x10);
+	writel(0xffffffff, tcu->base + TIMER_64 + 0x0c);
+	writel(0xffffffff, tcu->base + TIMER_64 + 0x18);
+	writel(0xffffffff, tcu->base + TIMER_64 + 0x14);
+	writel(0x18010, tcu->base + TIMER_64 + TM64_CTRL);
+	pr_debug("s5l8720-timer: started TIMER64\n");
+}
+
+static u64 s5l8720_cs_read(struct clocksource *cs)
+{
+	return s5l8720_clocksource_read(cs);
+}
+
+/* Timekeeping takes the counter's new value as its base, so a restart is fine. */
+static void s5l8720_cs_resume(struct clocksource *cs)
+{
+	s5l8720_timer64_start(s5l8720_tcu);
+}
+
+static struct clocksource s5l8720_clocksource = {
+	.name	= "timer64",
+	.rating	= 200,
+	.read	= s5l8720_cs_read,
+	.mask	= CLOCKSOURCE_MASK(64),
+	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
+	.resume	= s5l8720_cs_resume,
+};
+
 static int __init s5l8720_timer_init(struct device_node *np)
 {
 	int irq;
 	unsigned long flags = IRQF_TIMER | IRQF_IRQPOLL;
 	struct s5l8720_tcu *tcu;
+	u32 rate64;
 	int ret;
 
 	tcu = kzalloc(sizeof(*tcu), GFP_KERNEL);
@@ -158,16 +198,20 @@ static int __init s5l8720_timer_init(struct device_node *np)
 		goto out_free;
 	}
 
-	// [TODO] Enable clock gates and configure TIMER64 here
-	// instead of trusting the bootrom/bootloader
-	// TIMER64 is configured by bootloader in IpodSec
+	/*
+	 * TIMER64 is started by the bootloader on the iPod nanos (IpodSec), but
+	 * iBSS leaves it stopped on the iPod touch 2G. The clock gate must
+	 * already be open.
+	 */
+	s5l8720_timer64_start(tcu);
 
-	// /* Enable and register clocksource and sched_clock on timer 64 */
-	clocksource_mmio_init(NULL, "timer64",
-	           S5L8720_TIMER64_RATE, 200, 64,
-	           s5l8720_clocksource_read);
-	sched_clock_register(s5l8720_read_sched_clock, 64,
-	           S5L8720_TIMER64_RATE);
+	/* The counter runs at 2 MHz on the nanos and 12 MHz on the iPod touch 2G. */
+	if (of_property_read_u32(np, "clock-frequency", &rate64))
+		rate64 = S5L8720_TIMER64_RATE;
+	pr_info("s5l8720-timer: TIMER64 at %u Hz\n", rate64);
+
+	clocksource_register_hz(&s5l8720_clocksource, rate64);
+	sched_clock_register(s5l8720_read_sched_clock, 64, rate64);
 
 	/* Set up clockevent on timer E */
 	if (request_irq(irq, s5l8720_timer_interrupt, flags, "s5l8720 timer",

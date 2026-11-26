@@ -2262,6 +2262,63 @@ F:	include/dt-bindings/interrupt-controller/apple-aic.h
 F:	include/dt-bindings/pinctrl/apple.h
 F:	include/linux/soc/apple/*
 
+ARM/APPLE S5L8720 IPOD TOUCH 2G (N72) SUPPORT
+M:	Kailash <kailash.sudhakar@gmail.com>
+S:	Maintained
+F:	Documentation/ABI/testing/sysfs-driver-apple-n72-pmu
+F:	Documentation/ABI/testing/sysfs-driver-lis3lv02d
+F:	Documentation/ABI/testing/sysfs-driver-n72-yaftl
+F:	Documentation/ABI/testing/sysfs-driver-s5l8900-sdio
+F:	Documentation/ABI/testing/sysfs-platform-n72-lcd
+F:	Documentation/devicetree/bindings/arm/samsung/apple,n72.yaml
+F:	Documentation/devicetree/bindings/clock/apple,s5l8720-clock-gates.yaml
+F:	Documentation/devicetree/bindings/display/apple,n72-*.yaml
+F:	Documentation/devicetree/bindings/gpio/apple,s5l8720-gpio.yaml
+F:	Documentation/devicetree/bindings/gpu/apple,s5l8720-mbx.yaml
+F:	Documentation/devicetree/bindings/i2c/apple,s5l8720-i2c.yaml
+F:	Documentation/devicetree/bindings/input/apple,cd3272-mikey.yaml
+F:	Documentation/devicetree/bindings/input/touchscreen/apple,n72-multitouch.yaml
+F:	Documentation/devicetree/bindings/media/apple,s5l8720-*.yaml
+F:	Documentation/devicetree/bindings/mfd/apple,n72-pmu.yaml
+F:	Documentation/devicetree/bindings/mfd/apple,s5l8723-syscon.yaml
+F:	Documentation/devicetree/bindings/mmc/apple,s5l8900-sdio.yaml
+F:	Documentation/devicetree/bindings/mtd/apple,s5l8720-fmss.yaml
+F:	Documentation/devicetree/bindings/phy/apple,s5l8720-otgphy.yaml
+F:	Documentation/devicetree/bindings/soc/samsung/apple,n72-core-voltage.yaml
+F:	Documentation/devicetree/bindings/soc/samsung/apple,n72-sleep.yaml
+F:	Documentation/devicetree/bindings/sound/apple,s5l8720-*.yaml
+F:	Documentation/devicetree/bindings/sound/cirrus,cs42l58.yaml
+F:	Documentation/devicetree/bindings/sound/ti,lm48821.yaml
+F:	Documentation/devicetree/bindings/spi/apple,s5l8720-spi.yaml
+F:	Documentation/devicetree/bindings/timer/samsung,s5l8720-timer.yaml
+F:	arch/arm/boot/dts/samsung/s5l8720-n72.dts
+F:	arch/arm/mach-s5l87xx/pm-n72.c
+F:	arch/arm/mach-s5l87xx/regsnap.c
+F:	drivers/block/n72-nand/n72-yaftl-*
+F:	drivers/block/n72-nand/s5l8720-fmss.*
+F:	drivers/clk/clk-s5l8720-gate.c
+F:	drivers/cpuidle/cpuidle-s5l8720.c
+F:	drivers/gpio/gpio-s5l8720.c
+F:	drivers/gpu/drm/mbx/
+F:	drivers/gpu/drm/tiny/n72-clcd.c
+F:	drivers/gpu/drm/tiny/n72-lcd.c
+F:	drivers/input/misc/apple-cd3272.c
+F:	drivers/input/touchscreen/zephyr2.c
+F:	drivers/media/platform/apple/
+F:	drivers/mfd/apple-n72-pmu*
+F:	drivers/misc/s5l8720-amc.c
+F:	drivers/mmc/host/s5l8900-sdio.c
+F:	drivers/power/supply/apple-n72-pmu-power.c
+F:	drivers/regulator/apple-n72-pmu-regulator.c
+F:	drivers/rtc/rtc-apple-n72-pmu.c
+F:	drivers/soc/apple/n72-corev.c
+F:	drivers/spi/spi-s5l8720.c
+F:	drivers/video/backlight/apple-n72-pmu-backlight.c
+F:	include/linux/mfd/apple-n72-pmu.h
+F:	sound/soc/apple/s5l8720-i2s.c
+F:	sound/soc/codecs/cs42l58.c
+F:	sound/soc/codecs/lm48821.c
+
 ARM/ARTPEC MACHINE SUPPORT
 M:	Jesper Nilsson <jesper.nilsson@axis.com>
 M:	Lars Persson <lars.persson@axis.com>

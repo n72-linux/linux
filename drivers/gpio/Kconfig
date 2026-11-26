@@ -638,6 +638,14 @@ config GPIO_SIFIVE
 	help
 	  Say yes here to support the GPIO device on SiFive SoCs.
 
+config GPIO_S5L8720
+	tristate "Samsung/Apple S5L8720 GPIO support"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	select IRQ_DOMAIN
+	help
+	  GPIO controller of the Samsung/Apple S5L8720, as found in the iPod
+	  touch 2nd generation and iPod nano 4th generation.
+
 config GPIO_SIOX
 	tristate "SIOX GPIO support"
 	depends on SIOX

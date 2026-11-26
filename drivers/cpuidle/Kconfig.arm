@@ -75,6 +75,14 @@ config ARM_KIRKWOOD_CPUIDLE
 	help
 	  This adds the CPU Idle driver for Marvell Kirkwood SoCs.
 
+# Part of the S5L8720 platform, as iOS's cpuI handler is: no prompt.
+config ARM_S5L8720_CPUIDLE
+	def_bool CPU_S5L8720
+	help
+	  ARM WFI and states that divide the S5L8720 system clock by 2, 5
+	  or 11 while the CPU waits for an interrupt, as far as the blocks
+	  whose clocks are open allow.
+
 config ARM_ZYNQ_CPUIDLE
 	bool "CPU Idle Driver for Xilinx Zynq processors"
 	depends on (ARCH_ZYNQ || COMPILE_TEST) && !ARM64
