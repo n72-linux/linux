@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/apple,s5l8720-scaler.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S5L8720 scaler and colour space converter
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+properties:
+  compatible:
+    const: apple,s5l8720-scaler
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+
+additionalProperties: false
+
+examples:
+  - |
+    scaler@39000000 {
+        compatible = "apple,s5l8720-scaler";
+        reg = <0x39000000 0x1000>;
+        interrupt-parent = <&vic1>;
+        interrupts = <5>;
+        clocks = <&clkgate 3 4>;
+    };

@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/watchdog/apple,s5l8720-wdt.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S5L8720 watchdog timer
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+description:
+  The watchdog timer of the S5L8720, a child of the system controller node
+  that holds its registers (mfd/apple,s5l8723-syscon.yaml).
+
+allOf:
+  - $ref: watchdog.yaml#
+
+properties:
+  compatible:
+    const: apple,s5l8720-wdt
+
+  clock-frequency:
+    description: Rate of the bus clock the counter runs from, in Hz.
+
+required:
+  - compatible
+  - clock-frequency
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    watchdog {
+        compatible = "apple,s5l8720-wdt";
+        clock-frequency = <133000000>;
+    };

@@ -1,0 +1,11 @@
+What:		/sys/devices/platform/soc/38900000.lcd/panel_power
+Date:		November 2026
+KernelVersion:	6.14
+Contact:	Kailash <kailash.sudhakar@gmail.com>
+Description:
+		(RW) Panel power state of the iPod touch 2G (N72) display
+		controller (apple,n72-lcd). Reading returns "1" while the
+		panel is not blanked and "0" while it is. Writing a boolean
+		value (as accepted by kstrtobool, for example "0" or "1")
+		blanks or unblanks the panel; writing the current state has no
+		effect. Invalid input returns -EINVAL.

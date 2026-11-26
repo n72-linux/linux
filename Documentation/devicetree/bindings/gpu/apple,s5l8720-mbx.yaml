@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpu/apple,s5l8720-mbx.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S5L8720 PowerVR MBX Lite GPU
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+properties:
+  compatible:
+    const: apple,s5l8720-mbx
+
+  reg:
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: core
+      - const: wrapper
+
+  clocks:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  apple,feed-dma:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description:
+      DMA controller phandle and a channel number, used to feed the tile
+      accelerator (optional).
+    items:
+      - items:
+          - description: DMA controller
+          - description: channel
+
+  apple,framebuffer:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The boot framebuffer node.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - interrupts
+
+additionalProperties: false
+
+examples:
+  - |
+    gpu@3b000000 {
+        compatible = "apple,s5l8720-mbx";
+        reg = <0x3b000000 0x1000000>, <0x39400000 0x1000>;
+        reg-names = "core", "wrapper";
+        clocks = <&clkgate 3 5>;
+        apple,feed-dma = <&dmac1 5>;
+        apple,framebuffer = <&framebuffer0>;
+        interrupt-parent = <&vic1>;
+        interrupts = <21>;
+    };

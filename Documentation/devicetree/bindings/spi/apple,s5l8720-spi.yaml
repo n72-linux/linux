@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spi/apple,s5l8720-spi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S5L8720 SPI controller
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+description:
+  Chip selects are GPIOs (cs-gpios).
+
+allOf:
+  - $ref: spi-controller.yaml#
+
+properties:
+  compatible:
+    const: apple,s5l8720-spi
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    minItems: 1
+    maxItems: 2
+    description: Clocks, enabled together while the controller is in use.
+
+  clock-frequency: true
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - cs-gpios
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    spi@3e100000 {
+        compatible = "apple,s5l8720-spi";
+        reg = <0x3e100000 0x100>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+        clock-frequency = <24000000>;
+        clocks = <&clkgate 2 4>, <&clkgate 4 20>;
+        cs-gpios = <&gpio 87 GPIO_ACTIVE_LOW>;
+    };

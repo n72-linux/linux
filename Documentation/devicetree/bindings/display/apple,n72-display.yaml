@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,n72-display.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple iPod touch 2G (N72) display subsystem
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+description:
+  KMS device of the N72 display. It has no registers of its own; it refers to
+  the CLCD controller (apple,n72-lcd) and to the boot framebuffer.
+
+properties:
+  compatible:
+    const: apple,n72-display
+
+  apple,clcd:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The CLCD controller node (apple,n72-lcd).
+
+  apple,framebuffer:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The boot framebuffer node.
+
+  interrupts:
+    maxItems: 1
+    description: Optional; the CLCD frame interrupt.
+
+required:
+  - compatible
+  - apple,clcd
+  - apple,framebuffer
+
+additionalProperties: false
+
+examples:
+  - |
+    display-subsystem {
+        compatible = "apple,n72-display";
+        apple,clcd = <&clcd>;
+        apple,framebuffer = <&framebuffer0>;
+        interrupt-parent = <&vic0>;
+        interrupts = <13>;
+    };

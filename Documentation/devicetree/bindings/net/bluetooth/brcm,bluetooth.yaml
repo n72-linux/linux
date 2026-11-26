@@ -126,6 +126,7 @@ dependencies:
   brcm,requires-autobaud-mode: [ shutdown-gpios ]
 
 allOf:
+  - $ref: bluetooth-controller.yaml#
   - $ref: /schemas/serial/serial-peripheral-props.yaml#
   - if:
       not:

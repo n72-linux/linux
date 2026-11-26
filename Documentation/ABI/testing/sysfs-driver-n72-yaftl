@@ -1,0 +1,45 @@
+What:		/sys/devices/platform/soc/38a00000.nand-controller/image
+Date:		November 2026
+KernelVersion:	6.14
+Contact:	Kailash <kailash.sudhakar@gmail.com>
+Description:
+		(RW) The file that makes up the "nandlinux" disk on the
+		iPod touch 2G NAND (n72-yaftl). Writing takes one command per
+		line: "new PARTITION" starts an extent list in the named
+		partition; "ext START COUNT" adds the file's next extent
+		(512-byte sectors in the partition, whole 4 KiB blocks, in
+		file order); "commit" checks the list and creates the disk
+		read-only; "rw" allows writing (unless the fmss ftl_write
+		module parameter is 0). Reading returns the state: a first
+		line "state none|ro|rw" (followed by " failed" after a
+		failure), then lines "extents", "sectors", "buffered",
+		"read_sectors", "written_sectors", "flushes", "merged_pages"
+		and "ftl_" counters (free_blocks, user_blocks, index_blocks,
+		stale_index, user_pages, gc_pages, gc_blocks, index_pages,
+		erases, usn), each as "<name> <value>".
+
+What:		/sys/devices/platform/soc/38a00000.nand-controller/ftl_test
+Date:		November 2026
+KernelVersion:	6.14
+Contact:	Kailash <kailash.sudhakar@gmail.com>
+Description:
+		(RW) Test hook, present only when
+		CONFIG_BLK_DEV_N72_NAND_DEBUG is enabled. Writing
+		"LPN COUNT SEED" writes COUNT (up to 4096) test pages from
+		logical page LPN and reads each back; "v LPN COUNT SEED" only
+		reads and compares. Only logical pages above those exposed to
+		iOS are accepted (-ERANGE otherwise), and writing needs the
+		fmss ftl_write parameter (-EPERM otherwise). Reading returns
+		the page counts and free blocks, and the result of the last
+		test.
+
+What:		/sys/devices/platform/soc/38a00000.nand-controller/ftl_check
+Date:		November 2026
+KernelVersion:	6.14
+Contact:	Kailash <kailash.sudhakar@gmail.com>
+Description:
+		(RO) Test hook, present only when
+		CONFIG_BLK_DEV_N72_NAND_DEBUG is enabled. Reports what
+		writing would start from without writing anything: open
+		blocks, and how many index pages disagree with the map built
+		by the scan.

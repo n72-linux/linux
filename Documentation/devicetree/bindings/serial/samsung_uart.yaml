@@ -29,6 +29,9 @@ properties:
           - samsung,exynos850-uart
           - samsung,exynos8895-uart
       - items:
+          - const: apple,s5l8720-uart
+          - const: apple,s5l-uart
+      - items:
           - enum:
               - samsung,exynos7-uart
               - tesla,fsd-uart

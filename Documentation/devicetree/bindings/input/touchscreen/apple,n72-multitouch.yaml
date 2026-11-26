@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/touchscreen/apple,n72-multitouch.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple iPod touch 2G (N72) Zephyr2 multi-touch controller
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+allOf:
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: apple,n72-multitouch
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  reset-gpios:
+    maxItems: 1
+
+  vdd-supply:
+    description: 1.8 V controller power supply (PMU LDO3 on N72).
+
+  spi-max-frequency: true
+
+  spi-cpol: true
+
+  spi-cpha: true
+
+  apple,min-pressure:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Optional; see the driver.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - reset-gpios
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        touchscreen@0 {
+            compatible = "apple,n72-multitouch";
+            reg = <0>;
+            spi-max-frequency = <4500000>;
+            spi-cpol;
+            spi-cpha;
+            interrupts-extended = <&gpio 0x6d IRQ_TYPE_LEVEL_LOW>;
+            reset-gpios = <&gpio 86 GPIO_ACTIVE_HIGH>;
+        };
+    };

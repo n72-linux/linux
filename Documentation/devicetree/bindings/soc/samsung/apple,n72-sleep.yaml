@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/samsung/apple,n72-sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple iPod touch 2G (N72) suspend-to-RAM support
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+properties:
+  compatible:
+    const: apple,n72-sleep
+
+  reg:
+    minItems: 1
+    items:
+      - description: AES engine registers
+      - description: clock controller registers (optional)
+
+  clocks:
+    maxItems: 1
+
+  apple,pmu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The N72 PMU (apple,n72-pmu).
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    sleep@38c00000 {
+        compatible = "apple,n72-sleep";
+        reg = <0x38c00000 0x100>, <0x3c500000 0x100>;
+        clocks = <&clkgate 0 7>;
+        apple,pmu = <&pmu>;
+    };

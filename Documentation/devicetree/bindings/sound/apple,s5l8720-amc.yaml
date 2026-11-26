@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,s5l8720-amc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S5L8720 AMC audio coprocessor
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+properties:
+  compatible:
+    const: apple,s5l8720-amc
+
+  reg:
+    items:
+      - description: Data Engine registers
+      - description: SRAM
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    minItems: 1
+    maxItems: 3
+    description: Clocks, all enabled together.
+
+  apple,bus-frequency:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Bus clock frequency in Hz; optional.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+
+additionalProperties: false
+
+examples:
+  - |
+    audio-codec@38500000 {
+        compatible = "apple,s5l8720-amc";
+        reg = <0x38500000 0x2000>, <0x22000000 0x30000>;
+        interrupt-parent = <&vic0>;
+        interrupts = <18>;
+        clocks = <&clkgate 0 3>, <&clkgate 0 4>, <&clkgate 1 17>;
+        apple,bus-frequency = <133000000>;
+    };

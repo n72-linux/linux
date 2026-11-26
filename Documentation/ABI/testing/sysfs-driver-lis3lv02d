@@ -1,0 +1,13 @@
+What:		/sys/devices/platform/lis3lv02d/motion
+Date:		November 2026
+KernelVersion:	6.14
+Contact:	Kailash <kailash.sudhakar@gmail.com>
+Description:
+		(RW) Motion wake of 8-bit lis3lv02d parts that have an
+		interrupt. Writing a boolean value (kstrtobool) "1" arms the
+		chip's free-fall/wake-up units around the current position;
+		the first motion event disarms them and wakes poll() on the
+		"position" attribute. Writing "1" again re-arms. Writing "0"
+		stops motion watching. Reading returns "1" while armed, "0"
+		otherwise. Writing returns -EOPNOTSUPP on parts that are not
+		8-bit or have no interrupt.

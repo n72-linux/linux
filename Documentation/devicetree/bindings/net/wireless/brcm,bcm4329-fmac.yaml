@@ -122,6 +122,13 @@ properties:
       NVRAM. This would normally be filled in by the bootloader from platform
       configuration data.
 
+  apple,host-wake-only:
+    type: boolean
+    description: The HOST_WAKE interrupt reaches the host too slowly to carry
+      the data interrupts (on the iPod touch 2G it ends at an input of a PMU
+      that is read over I2C). Data interrupts then stay on the SDIO bus, and
+      the line is used only to wake the host while the bus sleeps.
+
   clocks:
     items:
       - description: External Low Power Clock input (32.768KHz)

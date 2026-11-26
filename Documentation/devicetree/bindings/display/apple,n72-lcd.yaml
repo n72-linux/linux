@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,n72-lcd.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple iPod touch 2G (N72) display controller and panel
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+description:
+  CLCD and MIPI DSI master of the N72, with the panel power sequencing used
+  across system sleep.
+
+properties:
+  compatible:
+    const: apple,n72-lcd
+
+  reg:
+    items:
+      - description: CLCD registers
+      - description: MIPI DSI master registers
+
+  reset-gpios:
+    maxItems: 1
+
+  apple,panel-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Panel identifier; optional.
+
+  power-supply:
+    description: Panel supply regulator.
+
+  clocks:
+    minItems: 1
+    maxItems: 5
+    description: Clocks, all enabled by the driver.
+
+  backlight:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Backlight device of the panel.
+
+required:
+  - compatible
+  - reg
+  - reset-gpios
+  - power-supply
+  - clocks
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    lcd@38900000 {
+        compatible = "apple,n72-lcd";
+        reg = <0x38900000 0x2000>, <0x3d800000 0x100>;
+        reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
+        apple,panel-id = <0xa2d10784>;
+        power-supply = <&ldo4>;
+        clocks = <&clkgate 0 14>, <&clkgate 3 9>, <&clkgate 3 10>,
+                 <&clkgate 3 11>, <&clkgate 1 19>;
+        backlight = <&pmu>;
+    };

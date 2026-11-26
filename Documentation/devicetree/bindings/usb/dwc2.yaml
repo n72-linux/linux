@@ -12,6 +12,15 @@ maintainers:
 allOf:
   - $ref: usb-drd.yaml#
   - $ref: usb-hcd.yaml#
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,s5l87xx-usb
+    then:
+      properties:
+        apple,vbus-psy-name: false
 
 properties:
   compatible:
@@ -58,6 +67,10 @@ properties:
           - const: snps,dwc2
       - const: amcc,dwc-otg
       - const: apm,apm82181-dwc-otg
+      - const: apple,s5l87xx-usb
+      - items:
+          - const: apple,s5l8720-usb
+          - const: apple,s5l87xx-usb
       - const: snps,dwc2
       - const: sophgo,cv1800-usb
       - const: st,stm32f4x9-fsotg
@@ -176,6 +189,13 @@ properties:
   access-controllers:
     minItems: 1
     maxItems: 2
+
+  apple,vbus-psy-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      Name of the power supply class device that reports VBUS, for a
+      peripheral-only controller. While it reports no power the gadget is
+      stopped and the controller's clock gated.
 
 dependencies:
   port: [ usb-role-switch ]

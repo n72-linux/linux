@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/samsung/apple,n72-core-voltage.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple iPod touch 2G (N72) core voltage states
+
+maintainers:
+  - Kailash <kailash.sudhakar@gmail.com>
+
+description: |
+  The S5L8720's two core voltage states, as iOS's clock controller keeps
+  them: 1.20 V, at which the system clock may run undivided, and 1.05 V,
+  with the system clock divided by 2, while the display and the USB PHY
+  are off. The core rail is the PMU's DOWN0 converter.
+
+properties:
+  compatible:
+    const: apple,n72-core-voltage
+
+  core-supply:
+    description: The SoC core rail (the PMU's down0 regulator).
+
+required:
+  - compatible
+  - core-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    core-voltage {
+        compatible = "apple,n72-core-voltage";
+        core-supply = <&down0>;
+    };
