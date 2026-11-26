@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+comment "Apple (Samsung S5L87xx) media platform drivers"
+
+config VIDEO_S5L8720_SCALER
+	tristate "Samsung/Apple S5L8720 scaler and colour space converter"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on VIDEO_DEV
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	default ARCH_S5L87XX
+	help
+	  The memory-to-memory scaler of the S5L8720 (iPod touch 2G): scaling
+	  with polyphase filters and conversion between NV12, RGB565 and
+	  32-bit RGB, one picture at a time.
+
+config VIDEO_S5L8720_VDEC
+	tristate
+
+config VIDEO_S5L8720_H264
+	tristate "Samsung/Apple S5L8720 H.264 decoder"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on VIDEO_DEV
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	select MEDIA_CONTROLLER
+	select VIDEO_S5L8720_VDEC
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	default ARCH_S5L87XX
+	help
+	  The H.264 decoder of the S5L8720 (iPod touch 2G) as a V4L2
+	  stateless decoder: progressive Baseline, Main and High profile
+	  streams, one slice per request, pictures in NV12.
+
+config VIDEO_S5L8720_MPVD
+	tristate "Samsung/Apple S5L8720 MPEG-4 and H.263 decoder"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on VIDEO_DEV
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	select VIDEO_S5L8720_VDEC
+	default ARCH_S5L87XX
+	help
+	  The MPEG-4 Part 2 (Simple Profile) and H.263 decoder of the
+	  S5L8720 (iPod touch 2G) as a V4L2 stateful decoder: one picture
+	  per buffer, pictures in NV12.
