@@ -274,6 +274,7 @@ static irqreturn_t s5l8720_spi_irq(int irq, void *data)
 	spin_lock_irqsave(&ss->lock, flags);
 	st = readl(b + SPI_STATUS);
 	if (!ss->active) {
+		writel(ss->setup, b + SPI_SETUP);
 		writel(st & STATUS_CLEAR_MASK, b + SPI_STATUS);
 		spin_unlock_irqrestore(&ss->lock, flags);
 		return IRQ_HANDLED;
@@ -315,7 +316,7 @@ static irqreturn_t s5l8720_spi_irq(int irq, void *data)
 	} else if (ss->tx_sent >= ss->seg) {
 		/* Stop TX FIFO IRQ once all words are queued; wait for RX. */
 		writel(ss->setup | SETUP_OPTION5 | SETUP_RX_ENABLE |
-		       SETUP_TX_ENABLE, b + SPI_SETUP);
+		       SETUP_ENABLE2, b + SPI_SETUP);
 	}
 	spin_unlock_irqrestore(&ss->lock, flags);
 	return IRQ_HANDLED;
@@ -354,11 +355,11 @@ static int s5l8720_spi_stream_irq(struct s5l8720_spi *ss, struct spi_device *spi
 	ss->setup = setup;
 	ss->active = true;
 	s5l8720_spi_push_words(b, tx, bytes, 0, ss->tx_sent);
-	writel(setup | SETUP_OPTION5 | SETUP_RX_ENABLE |
-	       (ss->tx_sent < seg ? SETUP_ENABLE2 : 0) | SETUP_TX_ENABLE,
-	       b + SPI_SETUP);
+	writel(setup | SETUP_OPTION5 | SETUP_RX_ENABLE | SETUP_ENABLE2 |
+	       (ss->tx_sent < seg ? SETUP_TX_ENABLE : 0), b + SPI_SETUP);
 	spin_unlock_irqrestore(&ss->lock, flags);
 
+	enable_irq(ss->irq);
 	left = wait_for_completion_timeout(&ss->done, msecs_to_jiffies(timeout_ms));
 	if (!left) {
 		spin_lock_irqsave(&ss->lock, flags);
@@ -367,13 +368,14 @@ static int s5l8720_spi_stream_irq(struct s5l8720_spi *ss, struct spi_device *spi
 		writel(setup, b + SPI_SETUP);
 		writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
 		spin_unlock_irqrestore(&ss->lock, flags);
-		synchronize_irq(ss->irq);
+		disable_irq(ss->irq);
 		dev_err(&spi->dev,
 			"SPI IRQ transfer timed out (%u/%u rx, %u/%u tx, status %08x, setup %08x)\n",
 			ss->rx_done, seg, ss->tx_sent, seg, st,
 			readl(b + SPI_SETUP));
 		return -ETIMEDOUT;
 	}
+	disable_irq(ss->irq);
 	return 0;
 }
 
@@ -693,8 +695,8 @@ static int s5l8720_spi_probe(struct platform_device *pdev)
 	if (ss->irq == -EPROBE_DEFER)
 		return -EPROBE_DEFER;
 	if (ss->irq >= 0) {
-		ret = devm_request_irq(&pdev->dev, ss->irq, s5l8720_spi_irq, 0,
-				       dev_name(&pdev->dev), ss);
+		ret = devm_request_irq(&pdev->dev, ss->irq, s5l8720_spi_irq,
+				       IRQF_NO_AUTOEN, dev_name(&pdev->dev), ss);
 		if (ret)
 			return dev_err_probe(&pdev->dev, ret, "SPI IRQ\n");
 	}
