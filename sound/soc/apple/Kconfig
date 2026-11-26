@@ -6,3 +6,11 @@ config SND_SOC_APPLE_MCA
 	help
 	  This option enables an ASoC platform driver for MCA peripherals found
 	  on Apple Silicon SoCs.
+
+config SND_SOC_S5L8720_I2S
+	tristate "Samsung/Apple S5L8720 I2S (iPod touch 2G)"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	select SND_SOC_GENERIC_DMAENGINE_PCM
+	help
+	  ASoC CPU DAI driver for the I2S controller of the S5L8720 SoC, as
+	  used for the CS42L58 codec of the iPod touch 2nd generation (N72).

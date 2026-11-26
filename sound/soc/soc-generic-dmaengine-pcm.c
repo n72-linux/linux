@@ -257,7 +257,8 @@ static int dmaengine_pcm_new(struct snd_soc_component *component,
 		}
 
 		snd_pcm_set_managed_buffer(substream,
-				SNDRV_DMA_TYPE_DEV_IRAM,
+				pcm->flags & SND_DMAENGINE_PCM_FLAG_NONCOHERENT ?
+				SNDRV_DMA_TYPE_NONCOHERENT : SNDRV_DMA_TYPE_DEV_IRAM,
 				dmaengine_dma_dev(pcm, substream),
 				prealloc_buffer_size,
 				max_buffer_size);

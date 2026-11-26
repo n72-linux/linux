@@ -932,6 +932,14 @@ config SND_SOC_CS42L56
 	tristate "Cirrus Logic CS42L56 CODEC"
 	depends on I2C && INPUT
 
+config SND_SOC_CS42L58
+	tristate "Cirrus Logic CS42L58 CODEC (iPod touch 2G)"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Playback-only driver for the CS42L58 codec of the iPod touch 2nd
+	  generation, programmed as iOS does (no public datasheet).
+
 config SND_SOC_CS42L73
 	tristate "Cirrus Logic CS42L73 CODEC"
 	depends on I2C
@@ -2530,6 +2538,13 @@ config SND_SOC_ZL38060
 	  Audio Interfaces (DAIs), analog outputs, and a block of 14 GPIOs.
 
 # Amp
+config SND_SOC_LM48821
+	tristate "TI LM48821 speaker amplifier"
+	depends on I2C
+	help
+	  Speaker amplifier with a single I2C volume byte and an enable
+	  GPIO, as used in the iPod touch 2nd generation.
+
 config SND_SOC_LM4857
 	tristate
 	depends on I2C

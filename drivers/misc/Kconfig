@@ -609,6 +609,16 @@ config MARVELL_CN10K_DPI
 	  To compile this driver as a module, choose M here: the module
 	  will be called mrvl_cn10k_dpi.
 
+config S5L8720_AMC
+	tristate "S5L8720 AMC audio coprocessor (iPod touch 2G)"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	depends on HAS_DMA
+	select FW_LOADER
+	help
+	  Hardware MP3, AAC, HE-AAC and ALAC decoding on the audio
+	  coprocessor ("AMC") of the Samsung/Apple S5L8720 SoC, through
+	  /dev/amc. Needs codec firmware files (apple/amc-*.bin).
+
 config MCHP_LAN966X_PCI
 	tristate "Microchip LAN966x PCIe Support"
 	depends on PCI

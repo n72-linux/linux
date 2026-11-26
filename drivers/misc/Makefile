@@ -74,4 +74,5 @@ obj-$(CONFIG_MARVELL_CN10K_DPI)	+= mrvl_cn10k_dpi.o
 lan966x-pci-objs		:= lan966x_pci.o
 lan966x-pci-objs		+= lan966x_pci.dtbo.o
 obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
+obj-$(CONFIG_S5L8720_AMC)	+= s5l8720-amc.o
 obj-y				+= keba/

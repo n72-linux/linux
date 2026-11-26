@@ -110,6 +110,13 @@ int snd_dmaengine_pcm_refine_runtime_hwparams(
  * playback.
  */
 #define SND_DMAENGINE_PCM_FLAG_HALF_DUPLEX BIT(3)
+/*
+ * The buffers are cached (SNDRV_DMA_TYPE_NONCOHERENT) and the PCM core syncs
+ * them for the device and the CPU as the pointers move, instead of an
+ * uncached or write-combined mapping: for CPUs that read the buffer back
+ * a lot (ALSA's dmix reads every sample it mixes into).
+ */
+#define SND_DMAENGINE_PCM_FLAG_NONCOHERENT BIT(4)
 
 /**
  * struct snd_dmaengine_pcm_config - Configuration data for dmaengine based PCM
