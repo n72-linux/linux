@@ -248,6 +248,28 @@ config TINYDRM_ST7735R
 
 	  If M is selected the module will be called st7735r.
 
+config DRM_N72_CLCD
+	tristate "DRM support for the S5L8720 CLCD (iPod touch 2G)"
+	depends on DRM && OF
+	select DRM_CLIENT_SELECTION
+	select DRM_GEM_DMA_HELPER
+	select DRM_KMS_HELPER
+	help
+	  KMS for the display controller of the iPod touch 2nd generation
+	  (N72): scan-out of window 0 from GEM DMA or PRIME buffers, page
+	  flips with vblank events, and an fbdev console. The panel itself
+	  stays as the boot loader set it up.
+
+config DRM_N72_LCD
+	bool "Display power of the iPod touch 2G (N72)"
+	depends on CPU_S5L8720 && PM_SLEEP && OF
+	help
+	  Power sequencing of the iPod touch 2nd generation (N72) display:
+	  the S5L8720 CLCD, its MIPI DSI master and the Pinot panel. Powers
+	  the panel down and up across system sleep, and while the system
+	  runs through the sysfs attribute panel_power, with the CLCD and DSI
+	  clock gates closed while the panel is off.
+
 config TINYDRM_S5L8740
     bool "DRM support for Samsung S5L8740"
 	depends on DRM && OF
