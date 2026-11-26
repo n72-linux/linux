@@ -90,6 +90,9 @@ struct s5l8702_i2c_dev {
 	bool clk_on;
 	bool busy;		/* a transfer owns the state machine */
 	bool s5l8720;
+	u32 bus_freq;
+	u32 clk_bits;
+	u32 stop_delay_us;
 	enum s5l8702_i2c_state state;
 	struct i2c_msg	*msg;
 	unsigned int msg_pos;
@@ -249,9 +252,10 @@ generate_stop:
 		if (i2c_dev->s5l8720) {
 			i2c_dev->pending_irq = 0;
 			if (irqs_disabled())
-				udelay(500);
+				udelay(i2c_dev->stop_delay_us);
 			else
-				usleep_range(500, 600);
+				usleep_range(i2c_dev->stop_delay_us,
+					     i2c_dev->stop_delay_us + 20);
 			goto again;
 		}
 		break;
@@ -308,12 +312,12 @@ static int s5l8702_i2c_do_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	dev_dbg(i2c_dev->dev, "%s start", __func__);
 
 	/*
-	 * Back in its reset state (CON has no clock select) after a suspend
+	 * Back in its reset state (CON has no interrupt enables) after a suspend
 	 * that cut the SoC's power, and before resume_noirq has run: the n72
 	 * sleep code talks to the PMU that early. Program it again first.
 	 */
 	if (i2c_dev->reinit ||
-	    !(s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_CON) & S5L8702_I2C_CON_CKSEL512))
+	    !(s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_CON) & S5L8702_I2C_CON_INTEN_BUSHOLD))
 		s5l8702_i2c_init(i2c_dev);
 
 	// [TODO] implement clocks this is equivalent to set controller active and clear interrupts
@@ -452,9 +456,6 @@ static const struct i2c_algorithm s5l8702_i2c_algo = {
 };
 
 static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
-	/* Clock prescaler (CON[3:0]) for the 512 divider: S5L8720 needs >= 1. */
-	u32 pre = i2c_dev->s5l8720 ? 1 : 0;
-
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_ADD, 0x40); // [TODO] Get slave address from DT
 
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK14, 1);
@@ -464,15 +465,14 @@ static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, 0); 
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, 0x40); // [TODO] Get slave address from DT
 
-	// [TODO] calculate divisors from freq in DT
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON,
 		S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_ACKGEN |
-		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(pre));
+		i2c_dev->clk_bits);
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, S5L8702_I2C_STAT_SOE); 
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK28, 0);
 
 	i2c_dev->iiccon = S5L8702_I2C_CON_INTEN_STOP | S5L8702_I2C_CON_INTEN_BUSHOLD |
-		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(pre);
+		i2c_dev->clk_bits;
 	/* Keep every status interrupt source enabled on the S5L8720. */
 	if (i2c_dev->s5l8720)
 		i2c_dev->iiccon |= S5L8702_I2C_CON_INTEN_ALL;
@@ -518,6 +518,41 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(&pdev->dev, s5l8702_i2c_unprepare, i2c_dev);
 	if (ret)
 		return ret;
+
+	{
+		u32 freq = 100000;
+
+		of_property_read_u32(pdev->dev.of_node, "clock-frequency", &freq);
+		freq = clamp_t(u32, freq, 10000, 400000);
+		i2c_dev->bus_freq = freq;
+		if (i2c_dev->s5l8720) {
+			unsigned long src_rate = i2c_dev->nclks > 0 ?
+						 clk_get_rate(i2c_dev->clks[0].clk) : 0;
+			u32 ticks, cksel, div, actual_div, pre, actual_hz;
+
+			if (!src_rate)
+				src_rate = 24000000;
+			ticks = DIV_ROUND_UP(src_rate, freq);
+			if (ticks <= 512) {
+				cksel = S5L8702_I2C_CON_CKSEL16;
+				div = DIV_ROUND_UP(ticks, 32);
+				actual_div = 32;
+			} else {
+				cksel = S5L8702_I2C_CON_CKSEL512;
+				div = DIV_ROUND_UP(ticks, 512);
+				actual_div = 512;
+			}
+			pre = clamp_t(u32, div > 0 ? div - 1 : 1, 1, 15);
+			i2c_dev->clk_bits = cksel | S5L8702_I2C_CON_CK_REG(pre);
+			actual_hz = src_rate / (actual_div * (pre + 1));
+			i2c_dev->stop_delay_us = max_t(u32, 50,
+						       DIV_ROUND_UP(12000000U, actual_hz));
+		} else {
+			i2c_dev->clk_bits = S5L8702_I2C_CON_CKSEL512 |
+					    S5L8702_I2C_CON_CK_REG(0);
+			i2c_dev->stop_delay_us = 500;
+		}
+	}
 
 	ret = s5l8702_i2c_clk_on(i2c_dev);
 	if (ret)
