@@ -32,11 +32,12 @@
 #define N72_PMU_STATUS_HPDET	BIT(2)	/* byte 0: PMU GPIO 2, high = plugged */
 
 /*
- * The PMU's own state survives suspend to RAM, but if hibernate turned
- * LDOs off, put back what was set before (enables after voltages).
+ * The PMU's state survives suspend to RAM, but if hibernate turned
+ * LDOs/GPIOs off, put back what was set before (enables after voltages).
  */
 static const u8 n72_ldo_saved[] = {
 	0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x10, 0x11, 0x13,
+	0x0e,
 };
 
 struct n72_pmu {
@@ -87,6 +88,11 @@ struct n72_pmu {
 #define N72_PMU_INT3_JACK	BIT(6)
 /* GPIO configuration: one nibble per GPIO from 0x0b; iOS activates GPIO 7 with 9 */
 #define N72_PMU_GPIO67_CFG	0x0e
+#define N72_PMU_GPIO6_MASK	0x0f
+#define N72_PMU_GPIO6_OUT	BIT(1)
+#define N72_PMU_GPIO6_HIGH	BIT(2)
+#define N72_PMU_GPIO6_LO	N72_PMU_GPIO6_OUT
+#define N72_PMU_GPIO6_HI	(N72_PMU_GPIO6_OUT | N72_PMU_GPIO6_HIGH)
 #define N72_PMU_INT2_MASK	0x08
 
 /*
@@ -224,8 +230,8 @@ static irqreturn_t n72_pmu_irq(int irq, void *data)
 /*
  * The PMU's GPIOs as iOS's device tree uses them: 2 = headphone detect
  * (input; its level in STATUS bit 2, a change in INT2 bit 6), 6 = BCM4325
- * power enable and 7 = Mikey interrupt, whose registers are not known yet
- * (found by observation; GPIO 6 is left as the boot chain set it, on).
+ * power enable (output; reg 0x0e low nibble: 0x6 high, 0x2 low), and 7 = Mikey
+ * interrupt (0x90).
  */
 static int n72_pmu_gpio_get(struct gpio_chip *gc, unsigned int off)
 {
@@ -233,15 +239,43 @@ static int n72_pmu_gpio_get(struct gpio_chip *gc, unsigned int off)
 	unsigned int v;
 	int ret;
 
-	if (off != 2)
-		return -EOPNOTSUPP;
-	ret = regmap_read(pmu->regmap, N72_PMU_STATUS, &v);
-	return ret < 0 ? ret : !!(v & N72_PMU_STATUS_HPDET);
+	if (off == 2) {
+		ret = regmap_read(pmu->regmap, N72_PMU_STATUS, &v);
+		return ret < 0 ? ret : !!(v & N72_PMU_STATUS_HPDET);
+	}
+	if (off == 6) {
+		ret = regmap_read(pmu->regmap, N72_PMU_GPIO67_CFG, &v);
+		return ret < 0 ? ret : !!(v & N72_PMU_GPIO6_HIGH);
+	}
+	return -EOPNOTSUPP;
+}
+
+static void n72_pmu_gpio_set(struct gpio_chip *gc, unsigned int off, int val)
+{
+	struct n72_pmu *pmu = gpiochip_get_data(gc);
+
+	if (off != 6)
+		return;
+	regmap_update_bits(pmu->regmap, N72_PMU_GPIO67_CFG, N72_PMU_GPIO6_MASK,
+			   val ? N72_PMU_GPIO6_HI : N72_PMU_GPIO6_LO);
 }
 
 static int n72_pmu_gpio_get_direction(struct gpio_chip *gc, unsigned int off)
 {
-	return off == 2 ? GPIO_LINE_DIRECTION_IN : -EOPNOTSUPP;
+	struct n72_pmu *pmu = gpiochip_get_data(gc);
+	unsigned int v;
+	int ret;
+
+	if (off == 2)
+		return GPIO_LINE_DIRECTION_IN;
+	if (off == 6) {
+		ret = regmap_read(pmu->regmap, N72_PMU_GPIO67_CFG, &v);
+		if (ret < 0)
+			return ret;
+		return (v & N72_PMU_GPIO6_OUT) ? GPIO_LINE_DIRECTION_OUT :
+						 GPIO_LINE_DIRECTION_IN;
+	}
+	return -EOPNOTSUPP;
 }
 
 static int n72_pmu_gpio_direction_input(struct gpio_chip *gc, unsigned int off)
@@ -249,9 +283,21 @@ static int n72_pmu_gpio_direction_input(struct gpio_chip *gc, unsigned int off)
 	return off == 2 ? 0 : -EOPNOTSUPP;
 }
 
+static int n72_pmu_gpio_direction_output(struct gpio_chip *gc, unsigned int off,
+					 int val)
+{
+	struct n72_pmu *pmu = gpiochip_get_data(gc);
+
+	if (off != 6)
+		return -EOPNOTSUPP;
+	return regmap_update_bits(pmu->regmap, N72_PMU_GPIO67_CFG,
+				  N72_PMU_GPIO6_MASK,
+				  val ? N72_PMU_GPIO6_HI : N72_PMU_GPIO6_LO);
+}
+
 static int n72_pmu_gpio_request(struct gpio_chip *gc, unsigned int off)
 {
-	return off == 2 ? 0 : -EOPNOTSUPP;
+	return (off == 2 || off == 6) ? 0 : -EOPNOTSUPP;
 }
 
 static int n72_pmu_gpio_to_irq(struct gpio_chip *gc, unsigned int off)
@@ -421,8 +467,10 @@ static int n72_pmu_gpio(struct n72_pmu *pmu)
 	pmu->gc.can_sleep = true;
 	pmu->gc.request = n72_pmu_gpio_request;
 	pmu->gc.get = n72_pmu_gpio_get;
+	pmu->gc.set = n72_pmu_gpio_set;
 	pmu->gc.get_direction = n72_pmu_gpio_get_direction;
 	pmu->gc.direction_input = n72_pmu_gpio_direction_input;
+	pmu->gc.direction_output = n72_pmu_gpio_direction_output;
 	pmu->gc.to_irq = n72_pmu_gpio_to_irq;
 	/*
 	 * GPIO 7 carries the Mikey chip's interrupt. iOS activates it with
