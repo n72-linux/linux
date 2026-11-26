@@ -65,6 +65,7 @@ struct isl29003_data {
 	u32 slopes[3];
 	u32 intercepts[3];
 	bool active;
+	bool has_irq;
 	struct delayed_work poll_work;
 	u8 meas_state;		/* 0 = idle, 1 = waiting D1, 2 = waiting D2 */
 	u16 d1;
@@ -621,12 +622,17 @@ static int isl29003_probe(struct i2c_client *client)
 			dev_warn(&client->dev,
 				 "IRQ %d unavailable (%d), using polling\n",
 				 client->irq, err);
+		else
+			data->has_irq = true;
 	}
 
 	/* register sysfs hooks */
 	err = sysfs_create_group(&client->dev.kobj, &isl29003_attr_group);
-	if (err)
+	if (err) {
+		if (data->has_irq)
+			devm_free_irq(&client->dev, client->irq, data);
 		goto exit_kfree;
+	}
 
 	dev_info(&client->dev, "driver version %s enabled%s\n", DRIVER_VERSION,
 		 data->calibrated ? " (calibrated D1/D2)" : "");
@@ -644,6 +650,8 @@ static void isl29003_remove(struct i2c_client *client)
 
 	sysfs_remove_group(&client->dev.kobj, &isl29003_attr_group);
 	isl29003_set_power_state(client, 0);
+	if (data->has_irq)
+		devm_free_irq(&client->dev, client->irq, data);
 	cancel_delayed_work_sync(&data->poll_work);
 	kfree(data);
 }
