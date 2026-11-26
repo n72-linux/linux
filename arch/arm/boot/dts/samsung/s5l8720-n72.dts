@@ -131,9 +131,10 @@
 	/*
 	 * BCM4325 (Wi-Fi and Bluetooth) power, shared by the SDIO card and the
 	 * Bluetooth UART device. iOS's function-power_enable is GPIO 6 of the
-	 * *PMU* (its phandle is pmu@73, like hp_detect = PMU GPIO 2 and Mikey's
-	 * interrupt_status = PMU GPIO 7), which the boot chain leaves on; the
-	 * PMU driver has no GPIOs yet, so this is a fixed, always-on supply.
+	 * *PMU* (its phandle is pmu@73, register 0x0e bits 3:0, like hp_detect
+	 * = PMU GPIO 2 and Mikey's interrupt_status = PMU GPIO 7). Left on by
+	 * the boot chain (regulator-boot-on) and gated once both consumers turn
+	 * it off.
 	 * It must not take the SoC's GPIO 6: that pad (function 2) is the
 	 * free-running 6 MHz codec master clock, and making it a GPIO output
 	 * removes the CS42L58's MCLK (no sound, no clocks from the codec).
@@ -798,10 +799,17 @@
 				hp-det-gpios = <&pmu 2 GPIO_ACTIVE_HIGH>;
 			};
 
-			/* iOS: interrupt 0x25, lux-scale 200 */
+			/* iOS als@44: GPIO IRQ 0x25 (active-low), 499 kOhm Rext, 3-curve D1/D2 calibration */
 			light-sensor@44 {
 				compatible = "isil,isl29003";
 				reg = <0x44>;
+				interrupts-extended = <&gpio 0x25 IRQ_TYPE_EDGE_FALLING>;
+				apple,external-scaling-resistor-ohm = <499000>;
+				apple,lux-scale = <200>;
+				apple,lux-offset = <4>;
+				apple,ratio-limits = <128 159 435>;
+				apple,slopes = <7848 1737 378>;
+				apple,intercepts = <6734 1496 477>;
 			};
 		};
 
