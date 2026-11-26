@@ -63,6 +63,12 @@
 		};
 	};
 
+	pmu {
+		compatible = "arm,arm1176-pmu";
+		interrupt-parent = <&vic1>;
+		interrupts = <31>;
+	};
+
 	/*
 	 * KMS (n72-clcd): scans out window 0 of the CLCD; takes over from
 	 * simplefb on the boot framebuffer.
