@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config BLK_DEV_N72_NAND
+	bool "Apple S5L8720 FMSS NAND block driver"
+	depends on CPU_S5L8720 || COMPILE_TEST
+	help
+	  Driver for the NAND controller of the iPod touch 2G. Page reads,
+	  programs and erases run Apple's sequencer programs, loaded as
+	  firmware; without them it can only reset the chips and read their
+	  IDs. Apple's VSVFL and YAFTL layers on top present iOS's partitions
+	  and an image file on its data partition as disks.
+
+config BLK_DEV_N72_NAND_DEBUG
+	bool "Raw test files for the S5L8720 FMSS NAND controller"
+	depends on BLK_DEV_N72_NAND
+	help
+	  Files in sysfs to read the chips' IDs, single pages and the
+	  controller's registers, to erase and program blocks of the
+	  reserve pool listed in the write_allow parameter, and to check
+	  the FTL and write test pages through it beyond what iOS exposes
+	  (ftl_check, ftl_test). For work on the driver only.
+
+	  If unsure, say N.

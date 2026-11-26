@@ -191,6 +191,14 @@ static const struct flash_info atmel_nor_parts[] = {
 		.no_sfdp_flags = SECT_4K,
 		.fixups = &atmel_nor_global_protection_fixups
 	}, {
+		/* boot NOR of the iPod touch 2G */
+		.id = SNOR_ID(0x1f, 0x45, 0x02),
+		.name = "at25df081",
+		.size = SZ_1M,
+		.flags = SPI_NOR_HAS_LOCK | SPI_NOR_SWP_IS_VOLATILE,
+		.no_sfdp_flags = SECT_4K,
+		.fixups = &atmel_nor_global_protection_fixups
+	}, {
 		.id = SNOR_ID(0x1f, 0x46, 0x01),
 		.name = "at26df161a",
 		.size = SZ_2M,
