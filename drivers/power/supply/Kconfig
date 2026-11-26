@@ -107,6 +107,18 @@ config BATTERY_ACT8945A
 	  Say Y here to enable support for power supply provided by
 	  Active-semi ActivePath ACT8945A charger.
 
+config BATTERY_APPLE_N72_PMU
+	tristate "Apple iPod touch 2G PMU battery and USB power"
+	depends on MFD_APPLE_N72_PMU
+	default MFD_APPLE_N72_PMU
+	help
+	  The battery (voltage, level, temperature, charger) and the USB
+	  power input of the PMU of the Apple iPod touch 2nd generation
+	  (N72), as the power supplies "battery" and "usb".
+
+	  This driver can also be built as a module. If so, the module
+	  will be called apple-n72-pmu-power.
+
 config BATTERY_CPCAP
 	tristate "Motorola CPCAP PMIC battery driver"
 	depends on MFD_CPCAP && IIO

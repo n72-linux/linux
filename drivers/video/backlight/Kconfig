@@ -290,6 +290,17 @@ config BACKLIGHT_APPLE
 	  If you have an Intel-based Apple say Y to enable a driver for its
 	  backlight.
 
+config BACKLIGHT_APPLE_N72_PMU
+	tristate "Apple iPod touch 2G PMU backlight"
+	depends on MFD_APPLE_N72_PMU
+	default MFD_APPLE_N72_PMU
+	help
+	  The display backlight of the Apple iPod touch 2nd generation (N72),
+	  which its PMU drives.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called apple-n72-pmu-backlight.
+
 config BACKLIGHT_QCOM_WLED
 	tristate "Qualcomm PMIC WLED Driver"
 	select REGMAP

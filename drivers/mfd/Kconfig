@@ -1510,6 +1510,19 @@ config MFD_SUN6I_PRCM
 	  in the A31, A23, and A33 SoCs. Other Allwinner SoCs contain similar
 	  hardware, but they do not use this driver.
 
+config MFD_APPLE_N72_PMU
+	tristate "Apple iPod touch 2G PMU"
+	depends on I2C && OF
+	depends on GPIOLIB
+	select MFD_CORE
+	select REGMAP_I2C
+	help
+	  The core of the Dialog D1759 PMU of the Apple iPod touch 2nd
+	  generation (N72): its interrupt and GPIOs (headphone detect, the
+	  Wi-Fi and Bluetooth host wake lines), power-off and the SoC core
+	  rail. The backlight, real-time clock, battery and LDO regulators
+	  have their own drivers, which this one's sub-devices use.
+
 config MFD_SYSCON
 	bool "System Controller Register R/W Based on Regmap"
 	select REGMAP_MMIO

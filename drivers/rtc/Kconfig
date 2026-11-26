@@ -1159,6 +1159,17 @@ config RTC_DRV_DS2404
 	  This driver can also be built as a module. If so, the module
 	  will be called rtc-ds2404.
 
+config RTC_DRV_APPLE_N72_PMU
+	tristate "Apple iPod touch 2G PMU RTC"
+	depends on MFD_APPLE_N72_PMU
+	default MFD_APPLE_N72_PMU
+	help
+	  The real-time clock and wake alarm of the PMU of the Apple iPod
+	  touch 2nd generation (N72).
+
+	  This driver can also be built as a module. If so, the module
+	  will be called rtc-apple-n72-pmu.
+
 config RTC_DRV_DA9052
 	tristate "Dialog DA9052/DA9053 RTC"
 	depends on PMIC_DA9052
