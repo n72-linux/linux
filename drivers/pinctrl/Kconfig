@@ -65,6 +65,23 @@ config PINCTRL_APPLE_GPIO
 	  This driver can also be built as a module. If so, the module
 	  will be called pinctrl-apple-gpio.
 
+config PINCTRL_S5L8720
+	tristate "Samsung/Apple S5L8720 pin controller and GPIO support"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	depends on OF
+	select PINMUX
+	select PINCONF
+	select GENERIC_PINCONF
+	select GENERIC_PINCTRL_GROUPS
+	select GENERIC_PINMUX_FUNCTIONS
+	select GPIOLIB
+	select OF_GPIO
+	select IRQ_DOMAIN
+	help
+	  Pin controller, GPIO and GPIO interrupt controller driver for the
+	  Samsung/Apple S5L8720 SoC, as found in the iPod touch 2nd generation.
+	  Provides pinmux, pull-up/down pinconf, and IRQ support.
+
 config PINCTRL_ARTPEC6
 	bool "Axis ARTPEC-6 pin controller driver"
 	depends on MACH_ARTPEC6

@@ -1,24 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * GPIO driver for the Samsung/Apple S5L8720
+ * Pin controller, GPIO and GPIO interrupt driver for the Samsung/Apple S5L8720
  *
  * The controller has banks of eight pins. Each bank has a 0x20-byte register
- * block: CON holds a 4-bit function per pin and DAT the pin levels. Pin
- * functions are changed through a single write-only register (FSEL) that
- * takes the bank, the pin and the new function; function 0 is input and
- * 0xe | value drives the pin as an output.
+ * block: CON holds a 4-bit function per pin, DAT the pin levels, and PUNB/PUNC
+ * (+0x0c/+0x10) the pull-up/pull-down enables. Pin functions are changed through a single
+ * write-only register (FSEL) that takes the bank, the pin and the new function;
+ * function 0 is input, 0xe | value drives the pin as an output (CON reads
+ * back 1 for outputs), and 2..7 select peripheral alternate functions.
  *
  * Interrupts go through a separate controller (GPIOIC) in groups of 32. Each
  * group has level, status, enable and type registers and its own parent
  * interrupt. GPIO interrupt numbers are pin + 24, so pin interrupts start in
  * group 0. Both-edge triggers are emulated with a level trigger whose
  * polarity flips every time it fires.
- *
- * There is no pin controller: the boot chain sets the pins' alternate
- * functions and they stay. For pads the board depends on, "apple,pin-functions"
- * (pairs of pin and function 2..7) writes them at probe, so they are right
- * whatever ran before (another kernel through kexec, a different loader).
  */
+
+#include <dt-bindings/pinctrl/apple.h>
 
 #include <linux/gpio/driver.h>
 #include <linux/interrupt.h>
@@ -30,16 +28,28 @@
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/pinctrl/pinconf.h>
+#include <linux/pinctrl/pinconf-generic.h>
+#include <linux/pinctrl/pinctrl.h>
+#include <linux/pinctrl/pinmux.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
+
+#include "core.h"
+#include "pinconf.h"
+#include "pinctrl-utils.h"
+#include "pinmux.h"
 
 #define S5L8720_GPIO_PINS_PER_BANK	8
 #define S5L8720_GPIO_BANK_STRIDE	0x20
 #define S5L8720_GPIO_CON		0x00
 #define S5L8720_GPIO_DAT		0x04
+#define S5L8720_GPIO_PUD1		0x0c	/* PUNB: 1 = pull-up enabled */
+#define S5L8720_GPIO_PUD2		0x10	/* PUNC: 1 = pull-down enabled */
 #define S5L8720_GPIO_FSEL		0x1e0
 /* FSEL sits right after the last bank. */
 #define S5L8720_GPIO_NBANKS		(S5L8720_GPIO_FSEL / S5L8720_GPIO_BANK_STRIDE)
+#define S5L8720_GPIO_NPINS		(S5L8720_GPIO_NBANKS * S5L8720_GPIO_PINS_PER_BANK)
 
 #define S5L8720_FSEL_BANK(b)		(((b) & 0x1f) << 16)
 #define S5L8720_FSEL_PIN(p)		(((p) & 0x7) << 8)
@@ -62,6 +72,9 @@ struct s5l8720_gpio_group {
 };
 
 struct s5l8720_gpio {
+	struct device *dev;
+	struct pinctrl_dev *pctldev;
+	struct pinctrl_desc pctl_desc;
 	struct gpio_chip chip;
 	void __iomem *base;
 	void __iomem *ic;
@@ -74,7 +87,8 @@ struct s5l8720_gpio {
 
 	/* saved across a suspend that may cut the SoC's power */
 	u32 con[S5L8720_GPIO_NBANKS];
-	/* PUD1, PUD2 (pulls) and the four sleep-state registers, 0x08..0x1c */
+	u32 dat[S5L8720_GPIO_NBANKS];
+	/* saved +0x08..+0x1c (includes PUNB +0x0c, PUNC +0x10, sleep-state regs) */
 	u32 bankregs[S5L8720_GPIO_NBANKS][6];
 	u32 ic_level[GPIOIC_MAX_GROUPS], ic_type[GPIOIC_MAX_GROUPS];
 	u32 ic_en[GPIOIC_MAX_GROUPS];
@@ -98,6 +112,208 @@ static void s5l8720_gpio_fsel(struct s5l8720_gpio *sg, unsigned int off,
 	spin_unlock_irqrestore(&sg->lock, flags);
 }
 
+/* ----------------------------------------------------------- pinctrl */
+
+static int s5l8720_dt_node_to_map(struct pinctrl_dev *pctldev,
+				  struct device_node *node,
+				  struct pinctrl_map **map,
+				  unsigned int *num_maps)
+{
+	struct s5l8720_gpio *sg = pinctrl_dev_get_drvdata(pctldev);
+	unsigned long *configs = NULL;
+	unsigned int num_configs = 0, reserved_maps = 0;
+	int num_pins, i, ret;
+
+	*map = NULL;
+	*num_maps = 0;
+
+	num_pins = of_property_count_u32_elems(node, "pinmux");
+	if (num_pins <= 0) {
+		dev_err(sg->dev, "missing or empty pinmux in %pOFn\n", node);
+		return num_pins ?: -EINVAL;
+	}
+
+	ret = pinconf_generic_parse_dt_config(node, pctldev, &configs, &num_configs);
+	if (ret)
+		return ret;
+
+	ret = pinctrl_utils_reserve_map(pctldev, map, &reserved_maps, num_maps,
+					num_pins * (1 + !!num_configs));
+	if (ret)
+		goto free_configs;
+
+	for (i = 0; i < num_pins; i++) {
+		u32 pinfunc, pin, func;
+		const char *group_name, *func_name;
+
+		ret = of_property_read_u32_index(node, "pinmux", i, &pinfunc);
+		if (ret)
+			goto free_map;
+
+		pin = APPLE_PIN(pinfunc);
+		func = APPLE_FUNC(pinfunc);
+		if (pin >= S5L8720_GPIO_NPINS || func == 1 || func > 7) {
+			ret = -EINVAL;
+			goto free_map;
+		}
+
+		group_name = pinctrl_generic_get_group_name(pctldev, pin);
+		func_name = pinmux_generic_get_function_name(pctldev, func);
+		ret = pinctrl_utils_add_map_mux(pctldev, map, &reserved_maps,
+						num_maps, group_name, func_name);
+		if (ret)
+			goto free_map;
+
+		if (num_configs) {
+			ret = pinctrl_utils_add_map_configs(pctldev, map,
+							    &reserved_maps,
+							    num_maps, group_name,
+							    configs, num_configs,
+							    PIN_MAP_TYPE_CONFIGS_PIN);
+			if (ret)
+				goto free_map;
+		}
+	}
+
+	kfree(configs);
+	return 0;
+
+free_map:
+	pinctrl_utils_free_map(pctldev, *map, *num_maps);
+free_configs:
+	kfree(configs);
+	return ret;
+}
+
+static const struct pinctrl_ops s5l8720_pinctrl_ops = {
+	.get_groups_count = pinctrl_generic_get_group_count,
+	.get_group_name = pinctrl_generic_get_group_name,
+	.get_group_pins = pinctrl_generic_get_group_pins,
+	.dt_node_to_map = s5l8720_dt_node_to_map,
+	.dt_free_map = pinctrl_utils_free_map,
+};
+
+static int s5l8720_pinmux_set(struct pinctrl_dev *pctldev, unsigned int func,
+			      unsigned int group)
+{
+	struct s5l8720_gpio *sg = pinctrl_dev_get_drvdata(pctldev);
+
+	if (group >= S5L8720_GPIO_NPINS || func == 1 || func > 7)
+		return -EINVAL;
+
+	s5l8720_gpio_fsel(sg, group, func);
+	return 0;
+}
+
+static const struct pinmux_ops s5l8720_pinmux_ops = {
+	.get_functions_count = pinmux_generic_get_function_count,
+	.get_function_name = pinmux_generic_get_function_name,
+	.get_function_groups = pinmux_generic_get_function_groups,
+	.set_mux = s5l8720_pinmux_set,
+	.strict = true,
+};
+
+static int s5l8720_pinconf_get(struct pinctrl_dev *pctldev, unsigned int pin,
+			       unsigned long *config)
+{
+	struct s5l8720_gpio *sg = pinctrl_dev_get_drvdata(pctldev);
+	enum pin_config_param param = pinconf_to_config_param(*config);
+	void __iomem *bank = s5l8720_bank(sg, pin);
+	u32 bit = BIT(pin % S5L8720_GPIO_PINS_PER_BANK);
+	bool up = !!(readl(bank + S5L8720_GPIO_PUD1) & bit);
+	bool dn = !!(readl(bank + S5L8720_GPIO_PUD2) & bit);
+
+	switch (param) {
+	case PIN_CONFIG_BIAS_DISABLE:
+		if (up || dn)
+			return -EINVAL;
+		break;
+	case PIN_CONFIG_BIAS_PULL_UP:
+		if (!up || dn)
+			return -EINVAL;
+		break;
+	case PIN_CONFIG_BIAS_PULL_DOWN:
+		if (up || !dn)
+			return -EINVAL;
+		break;
+	default:
+		return -ENOTSUPP;
+	}
+
+	*config = pinconf_to_config_packed(param, 1);
+	return 0;
+}
+
+static int s5l8720_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
+			       unsigned long *configs, unsigned int num_configs)
+{
+	struct s5l8720_gpio *sg = pinctrl_dev_get_drvdata(pctldev);
+	void __iomem *bank = s5l8720_bank(sg, pin);
+	u32 bit = BIT(pin % S5L8720_GPIO_PINS_PER_BANK);
+	unsigned int i;
+
+	for (i = 0; i < num_configs; i++) {
+		enum pin_config_param param = pinconf_to_config_param(configs[i]);
+		unsigned long flags;
+		u32 p1, p2;
+
+		switch (param) {
+		case PIN_CONFIG_BIAS_DISABLE:
+			spin_lock_irqsave(&sg->lock, flags);
+			p1 = readl(bank + S5L8720_GPIO_PUD1) & ~bit;
+			p2 = readl(bank + S5L8720_GPIO_PUD2) & ~bit;
+			writel(p1, bank + S5L8720_GPIO_PUD1);
+			writel(p2, bank + S5L8720_GPIO_PUD2);
+			spin_unlock_irqrestore(&sg->lock, flags);
+			break;
+		case PIN_CONFIG_BIAS_PULL_UP:
+			spin_lock_irqsave(&sg->lock, flags);
+			p1 = readl(bank + S5L8720_GPIO_PUD1) | bit;
+			p2 = readl(bank + S5L8720_GPIO_PUD2) & ~bit;
+			writel(p1, bank + S5L8720_GPIO_PUD1);
+			writel(p2, bank + S5L8720_GPIO_PUD2);
+			spin_unlock_irqrestore(&sg->lock, flags);
+			break;
+		case PIN_CONFIG_BIAS_PULL_DOWN:
+			spin_lock_irqsave(&sg->lock, flags);
+			p1 = readl(bank + S5L8720_GPIO_PUD1) & ~bit;
+			p2 = readl(bank + S5L8720_GPIO_PUD2) | bit;
+			writel(p1, bank + S5L8720_GPIO_PUD1);
+			writel(p2, bank + S5L8720_GPIO_PUD2);
+			spin_unlock_irqrestore(&sg->lock, flags);
+			break;
+		default:
+			return -ENOTSUPP;
+		}
+	}
+	return 0;
+}
+
+static int s5l8720_pinconf_group_get(struct pinctrl_dev *pctldev,
+				     unsigned int selector,
+				     unsigned long *config)
+{
+	return s5l8720_pinconf_get(pctldev, selector, config);
+}
+
+static int s5l8720_pinconf_group_set(struct pinctrl_dev *pctldev,
+				     unsigned int selector,
+				     unsigned long *configs,
+				     unsigned int num_configs)
+{
+	return s5l8720_pinconf_set(pctldev, selector, configs, num_configs);
+}
+
+static const struct pinconf_ops s5l8720_pinconf_ops = {
+	.is_generic = true,
+	.pin_config_get = s5l8720_pinconf_get,
+	.pin_config_set = s5l8720_pinconf_set,
+	.pin_config_group_get = s5l8720_pinconf_group_get,
+	.pin_config_group_set = s5l8720_pinconf_group_set,
+};
+
+/* ------------------------------------------------------------- GPIO */
+
 static int s5l8720_gpio_get(struct gpio_chip *chip, unsigned int off)
 {
 	struct s5l8720_gpio *sg = gpiochip_get_data(chip);
@@ -112,8 +328,8 @@ static int s5l8720_gpio_get_direction(struct gpio_chip *chip, unsigned int off)
 	u32 con = readl(s5l8720_bank(sg, off) + S5L8720_GPIO_CON);
 	u32 func = (con >> ((off % S5L8720_GPIO_PINS_PER_BANK) * 4)) & 0xf;
 
-	return (func & 0xe) == 0xe ? GPIO_LINE_DIRECTION_OUT :
-				     GPIO_LINE_DIRECTION_IN;
+	return func == 1 || (func & 0xe) == 0xe ? GPIO_LINE_DIRECTION_OUT :
+						  GPIO_LINE_DIRECTION_IN;
 }
 
 static int s5l8720_gpio_direction_input(struct gpio_chip *chip,
@@ -137,6 +353,8 @@ static void s5l8720_gpio_set(struct gpio_chip *chip, unsigned int off, int value
 	s5l8720_gpio_fsel(gpiochip_get_data(chip), off,
 			  S5L8720_FUNC_OUTPUT(value));
 }
+
+/* ----------------------------------------------------------- GPIOIC */
 
 static void s5l8720_ic_rmw(struct s5l8720_gpio *sg, u32 reg, u32 mask, u32 val)
 {
@@ -226,7 +444,7 @@ static int s5l8720_irq_set_type(struct irq_data *d, unsigned int type)
 }
 
 static struct irq_chip s5l8720_irq_chip = {
-	.name		= "gpio-s5l8720",
+	.name		= "pinctrl-s5l8720",
 	.irq_ack	= s5l8720_irq_ack,
 	.irq_mask	= s5l8720_irq_mask,
 	.irq_unmask	= s5l8720_irq_unmask,
@@ -336,25 +554,96 @@ static int s5l8720_gpio_irq_init(struct platform_device *pdev,
 	return 0;
 }
 
+/* ------------------------------------------------------------ probe */
+
+static int s5l8720_pinctrl_register(struct platform_device *pdev,
+				    struct s5l8720_gpio *sg)
+{
+	static const char *const pinmux_funcs[] = {
+		"gpio", "reserved", "func2", "func3",
+		"func4", "func5", "func6", "func7",
+	};
+	struct pinctrl_pin_desc *pins;
+	const char **pin_names;
+	unsigned int *pin_nums;
+	unsigned int i;
+	int ret;
+
+	pins = devm_kmalloc_array(&pdev->dev, S5L8720_GPIO_NPINS,
+				  sizeof(*pins), GFP_KERNEL);
+	pin_names = devm_kmalloc_array(&pdev->dev, S5L8720_GPIO_NPINS,
+				       sizeof(*pin_names), GFP_KERNEL);
+	pin_nums = devm_kmalloc_array(&pdev->dev, S5L8720_GPIO_NPINS,
+				      sizeof(*pin_nums), GFP_KERNEL);
+	if (!pins || !pin_names || !pin_nums)
+		return -ENOMEM;
+
+	for (i = 0; i < S5L8720_GPIO_NPINS; i++) {
+		pins[i].number = i;
+		pins[i].name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "PIN%u", i);
+		if (!pins[i].name)
+			return -ENOMEM;
+		pins[i].drv_data = sg;
+		pin_names[i] = pins[i].name;
+		pin_nums[i] = i;
+	}
+
+	sg->pctl_desc.name = dev_name(&pdev->dev);
+	sg->pctl_desc.pins = pins;
+	sg->pctl_desc.npins = S5L8720_GPIO_NPINS;
+	sg->pctl_desc.pctlops = &s5l8720_pinctrl_ops;
+	sg->pctl_desc.pmxops = &s5l8720_pinmux_ops;
+	sg->pctl_desc.confops = &s5l8720_pinconf_ops;
+	sg->pctl_desc.owner = THIS_MODULE;
+
+	ret = devm_pinctrl_register_and_init(&pdev->dev, &sg->pctl_desc, sg,
+					     &sg->pctldev);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "pinctrl init failed\n");
+
+	for (i = 0; i < S5L8720_GPIO_NPINS; i++) {
+		ret = pinctrl_generic_add_group(sg->pctldev, pins[i].name,
+						pin_nums + i, 1, sg);
+		if (ret < 0)
+			return ret;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(pinmux_funcs); i++) {
+		ret = pinmux_generic_add_function(sg->pctldev, pinmux_funcs[i],
+						  pin_names, S5L8720_GPIO_NPINS,
+						  sg);
+		if (ret < 0)
+			return ret;
+	}
+
+	return pinctrl_enable(sg->pctldev);
+}
+
 static int s5l8720_gpio_probe(struct platform_device *pdev)
 {
 	struct s5l8720_gpio *sg;
+	int ret;
 
 	sg = devm_kzalloc(&pdev->dev, sizeof(*sg), GFP_KERNEL);
 	if (!sg)
 		return -ENOMEM;
 
+	sg->dev = &pdev->dev;
 	sg->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sg->base))
 		return PTR_ERR(sg->base);
 
 	spin_lock_init(&sg->lock);
+	platform_set_drvdata(pdev, sg);
 
 	sg->chip.label = dev_name(&pdev->dev);
 	sg->chip.parent = &pdev->dev;
 	sg->chip.owner = THIS_MODULE;
 	sg->chip.base = -1;
-	sg->chip.ngpio = S5L8720_GPIO_NBANKS * S5L8720_GPIO_PINS_PER_BANK;
+	sg->chip.ngpio = S5L8720_GPIO_NPINS;
+	sg->chip.request = gpiochip_generic_request;
+	sg->chip.free = gpiochip_generic_free;
+	sg->chip.set_config = gpiochip_generic_config;
 	sg->chip.get = s5l8720_gpio_get;
 	sg->chip.set = s5l8720_gpio_set;
 	sg->chip.get_direction = s5l8720_gpio_get_direction;
@@ -363,14 +652,17 @@ static int s5l8720_gpio_probe(struct platform_device *pdev)
 
 	/* The interrupt controller is optional (second "reg" entry). */
 	if (platform_get_resource(pdev, IORESOURCE_MEM, 1)) {
-		int ret = s5l8720_gpio_irq_init(pdev, sg);
-
+		ret = s5l8720_gpio_irq_init(pdev, sg);
 		if (ret)
 			return ret;
 		sg->chip.to_irq = s5l8720_gpio_to_irq;
 	}
 
-	/* Board pads that must be in a peripheral function (pin, function). */
+	ret = s5l8720_pinctrl_register(pdev, sg);
+	if (ret)
+		return ret;
+
+	/* Legacy fallback for DTBs using apple,pin-functions. */
 	{
 		struct device_node *np = pdev->dev.of_node;
 		int n = of_property_count_u32_elems(np, "apple,pin-functions");
@@ -390,7 +682,6 @@ static int s5l8720_gpio_probe(struct platform_device *pdev)
 		}
 	}
 
-	platform_set_drvdata(pdev, sg);
 	return devm_gpiochip_add_data(&pdev->dev, &sg->chip, sg);
 }
 
@@ -410,6 +701,7 @@ static int s5l8720_gpio_suspend_noirq(struct device *dev)
 		unsigned int r;
 
 		sg->con[b] = readl(bank + S5L8720_GPIO_CON);
+		sg->dat[b] = readl(bank + S5L8720_GPIO_DAT);
 		for (r = 0; r < 6; r++)
 			sg->bankregs[b][r] = readl(bank + 0x8 + r * 4);
 	}
@@ -436,9 +728,15 @@ static int s5l8720_gpio_resume_noirq(struct device *dev)
 		for (p = 0; p < 6; p++)
 			writel(sg->bankregs[b][p],
 			       sg->base + b * S5L8720_GPIO_BANK_STRIDE + 0x8 + p * 4);
-		for (p = 0; p < S5L8720_GPIO_PINS_PER_BANK; p++)
+		for (p = 0; p < S5L8720_GPIO_PINS_PER_BANK; p++) {
+			u32 func = (sg->con[b] >> (p * 4)) & 0xf;
+
+			/* CON reads back 1 for GPIO outputs; FSEL takes 0xe/0xf. */
+			if (func == 1)
+				func = S5L8720_FUNC_OUTPUT(sg->dat[b] & BIT(p));
 			s5l8720_gpio_fsel(sg, b * S5L8720_GPIO_PINS_PER_BANK + p,
-					  (sg->con[b] >> (p * 4)) & 0xf);
+					  func);
+		}
 	}
 	/*
 	 * Pin functions only change on a power loss; interrupt enables also
@@ -465,20 +763,22 @@ static const struct dev_pm_ops s5l8720_gpio_pm_ops = {
 };
 
 static const struct of_device_id s5l8720_gpio_of_match[] = {
+	{ .compatible = "apple,s5l8720-pinctrl" },
 	{ .compatible = "apple,s5l8720-gpio" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s5l8720_gpio_of_match);
 
 static struct platform_driver s5l8720_gpio_driver = {
-	.probe = s5l8720_gpio_probe,
+	.probe		= s5l8720_gpio_probe,
 	.driver = {
-		.name = "gpio-s5l8720",
+		.name		= "pinctrl-s5l8720",
 		.of_match_table = s5l8720_gpio_of_match,
-		.pm = pm_sleep_ptr(&s5l8720_gpio_pm_ops),
+		.pm		= pm_sleep_ptr(&s5l8720_gpio_pm_ops),
+		.suppress_bind_attrs = true,
 	},
 };
 module_platform_driver(s5l8720_gpio_driver);
 
-MODULE_DESCRIPTION("Samsung/Apple S5L8720 GPIO driver");
+MODULE_DESCRIPTION("Samsung/Apple S5L8720 pinctrl and GPIO controller");
 MODULE_LICENSE("GPL");

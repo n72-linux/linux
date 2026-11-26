@@ -16,6 +16,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/apple.h>
 
 / {
 	#address-cells = <1>;
@@ -323,15 +324,17 @@
 			reg-io-width = <4>;
 			interrupt-parent = <&vic0>;
 			interrupts = <24>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart0_pins>;
 			status = "okay";
 		};
 
 		/*
 		 * UART1: the BCM4325's Bluetooth (iOS uart1@5B00000, interrupt
 		 * 0x19, device-clocks id 0x30: 0x4c bit 29 and 0x6c bit 8). TX is
-		 * GPIO 79 (function 2 from the boot loader) and RTS GPIO 80, put in
-		 * its UART function by the GPIO node: with the UART's auto flow
-		 * control the chip is held off when the RX FIFO fills.
+		 * GPIO 79 (function 2) and RTS GPIO 80 (function 2): with the
+		 * UART's auto flow control the chip is held off when the RX
+		 * FIFO fills.
 		 */
 		uart1: serial@3db00000 {
 			compatible = "apple,s5l8720-uart", "apple,s5l-uart";
@@ -341,6 +344,8 @@
 			reg-io-width = <4>;
 			interrupt-parent = <&vic0>;
 			interrupts = <25>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart1_pins>;
 			/*
 			 * Sending goes through DMAC0 as under iOS (uart1
 			 * dma-channels: request 8 to UTXH, 8-bit, one byte per
@@ -459,6 +464,8 @@
 			clock-names = "i2s", "dmacm";
 			dmas = <&dmac0 10 2>, <&dmac0 11 2>;
 			dma-names = "tx", "rx";
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2s0_pins>;
 			#sound-dai-cells = <0>;
 		};
 
@@ -633,31 +640,53 @@
 		};
 
 		/*
-		 * GPIO banks and, as a second range, the GPIO interrupt
-		 * controller. Five interrupt groups of 32 (iOS device tree:
-		 * VIC 0x21, 0x20, 0x1f, 0x03, 0x02); interrupt = pin + 24.
+		 * Pin controller, GPIO banks and, as a second range, the GPIO
+		 * interrupt controller. Five interrupt groups of 32 (iOS device
+		 * tree: VIC 0x21, 0x20, 0x1f, 0x03, 0x02); interrupt = pin + 24.
 		 */
-		gpio: gpio-controller@3cf00000 {
-			compatible = "apple,s5l8720-gpio";
+		gpio: pinctrl@3cf00000 {
+			compatible = "apple,s5l8720-pinctrl", "apple,s5l8720-gpio";
 			reg = <0x3cf00000 0x200>, <0x39700000 0x1000>;
-			/*
-			 * Pads that must be in a peripheral function:
-			 * I2S0, as the boot chain and iOS have them: GPIO 6 = the
-			 * codec's 6 MHz MCLK output (function 2), GPIO 7 and 20 =
-			 * bit/frame clock inputs from the codec (function 3), GPIO 21
-			 * = data out (function 2).
-			 * GPIO 80 = UART1's RTS to the BCM4325 (iOS uart1
-			 * function-rts, function 2; the boot chain leaves it a GPIO
-			 * output, so the chip could never be throttled).
-			 */
-			apple,pin-functions = <6 2>, <7 3>, <20 3>, <21 2>, <80 2>;
 			gpio-controller;
 			#gpio-cells = <2>;
+			gpio-ranges = <&gpio 0 0 120>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupts-extended = <&vic1 1>, <&vic1 0>, <&vic0 31>,
 					      <&vic0 3>, <&vic0 2>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2s0_mclk_hog>;
 
+			/* Free-running 6 MHz codec MCLK: permanently claimed and protected. */
+			i2s0_mclk_hog: i2s0-mclk-pins {
+				pinmux = <APPLE_PINMUX(6, 2)>;
+			};
+
+			i2s0_pins: i2s0-pins {
+				pinmux = <APPLE_PINMUX(7, 3)>,
+					 <APPLE_PINMUX(20, 3)>,
+					 <APPLE_PINMUX(21, 2)>;
+			};
+
+			uart0_pins: uart0-pins {
+				pinmux = <APPLE_PINMUX(4, 2)>,
+					 <APPLE_PINMUX(5, 2)>;
+			};
+
+			uart1_pins: uart1-pins {
+				pinmux = <APPLE_PINMUX(79, 2)>,
+					 <APPLE_PINMUX(80, 2)>;
+			};
+
+			i2c0_pins: i2c0-pins {
+				pinmux = <APPLE_PINMUX(23, 2)>,
+					 <APPLE_PINMUX(24, 2)>;
+			};
+
+			i2c1_pins: i2c1-pins {
+				pinmux = <APPLE_PINMUX(10, 2)>,
+					 <APPLE_PINMUX(11, 2)>;
+			};
 		};
 
 		/*
@@ -675,6 +704,8 @@
 			clock-frequency = <400000>;
 			/* I2C0, gated between transfers (hardware clock gate id 0x12) */
 			clocks = <&clkgate 1 4>, <&clkgate 4 11>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c0_pins>;
 			status = "okay";
 
 			pmu: pmic@73 {
@@ -787,6 +818,8 @@
 			clock-frequency = <400000>;
 			/* I2C1, gated between transfers (hardware clock gate id 0x13) */
 			clocks = <&clkgate 1 6>, <&clkgate 4 12>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c1_pins>;
 			status = "okay";
 
 			/*
