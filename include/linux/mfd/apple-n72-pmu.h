@@ -56,4 +56,10 @@ enum n72_pmu_event {
 int devm_n72_pmu_notifier(struct device *dev, struct n72_pmu *pmu,
 			  struct notifier_block *nb);
 
+#if IS_REACHABLE(CONFIG_BACKLIGHT_APPLE_N72_PMU)
+void n72_pmu_bl_set_mie_scale(u8 scale);
+#else
+static inline void n72_pmu_bl_set_mie_scale(u8 scale) {}
+#endif
+
 #endif

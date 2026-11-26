@@ -176,6 +176,7 @@ static void n72_v_update(struct drm_plane *plane, struct drm_atomic_state *state
 		l->scanout_skipped = true;	/* put up again at N72_LCD_ON */
 	}
 	spin_unlock_irqrestore(&p->reg_lock, flags);
+	n72_mie_sync(p);
 	/* a flip of this plane alone: the primary's update has not sent it */
 	if (ev && crtc->state->active) {
 		crtc->state->event = NULL;
@@ -193,6 +194,7 @@ static void n72_v_disable(struct drm_plane *plane, struct drm_atomic_state *stat
 	if (n72_regs_ok(p))
 		n72_v_off(p);
 	spin_unlock_irqrestore(&p->reg_lock, flags);
+	n72_mie_sync(p);
 }
 
 static const struct drm_plane_helper_funcs n72_v_helper_funcs = {

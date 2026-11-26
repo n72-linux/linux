@@ -70,6 +70,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_blend.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fbdev_dma.h>
@@ -143,6 +144,7 @@ static irqreturn_t n72_irq(int irq, void *data)
 	if (st & CLCD_IRQ_FRAME) {
 		WRITE_ONCE(p->last_irq, ktime_get());
 		n72_vblank(p, true);
+		n72_mie_vblank(p);
 	}
 	if (st & 0x1700)
 		dev_warn_ratelimited(p->dev, "underrun %08x\n", st);
@@ -161,13 +163,28 @@ static enum hrtimer_restart n72_vbl_fn(struct hrtimer *t)
 }
 
 /* Frame interrupt source on, pending and status cleared, enable */
-static void n72_frame_irq_on(struct n72_clcd *p)
+void n72_frame_irq_on(struct n72_clcd *p)
 {
 	writel(CLCD_VIDINT_FRAME, p->regs + CLCD_VIDINT_CTL);
 	writel(0xf, p->regs + CLCD_VIDINT_PEND);
 	writel(CLCD_IRQ_FRAME, p->regs + CLCD_IRQ_ST);
 	writel(readl(p->regs + CLCD_IRQ_EN) | CLCD_IRQ_FRAME, p->regs + CLCD_IRQ_EN);
 	WRITE_ONCE(p->last_irq, ktime_get());
+}
+
+/* reg_lock held */
+void n72_vbl_hold_mie(struct n72_clcd *p, bool hold)
+{
+	if (hold && !p->mie_vbl_held) {
+		p->mie_vbl_held = true;
+		if (!p->vbl_users++ && n72_regs_ok(p))
+			n72_frame_irq_on(p);
+	} else if (!hold && p->mie_vbl_held) {
+		p->mie_vbl_held = false;
+		if (!--p->vbl_users && n72_regs_ok(p))
+			writel(readl(p->regs + CLCD_IRQ_EN) & ~CLCD_IRQ_FRAME,
+			       p->regs + CLCD_IRQ_EN);
+	}
 }
 
 /* The interrupt and the timer run while any layer wants vblanks. */
@@ -250,6 +267,9 @@ static u32 n72_layer_cfg(u32 fourcc, unsigned int rotation, bool shell)
 	case DRM_FORMAT_RGB565:
 		fmt = CLCD_L_CFG_RGB565;
 		shell = false;
+		break;
+	case DRM_FORMAT_ARGB1555:
+		fmt = CLCD_L_CFG_ARGB1555;
 		break;
 	case DRM_FORMAT_ARGB4444:
 		fmt = CLCD_L_CFG_ARGB4444;
@@ -540,11 +560,13 @@ static const struct drm_simple_display_pipe_funcs n72_pipe_funcs = {
 static const u32 n72_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_RGB565,
+	DRM_FORMAT_ARGB1555,
 	DRM_FORMAT_ARGB4444,
 };
 /* blended with its alpha: nothing without one */
 static const u32 n72_shell_formats[] = {
 	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_ARGB1555,
 	DRM_FORMAT_ARGB4444,
 };
 
@@ -572,11 +594,52 @@ static const struct drm_connector_funcs n72_conn_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
+static int n72_atomic_check(struct drm_device *dev, struct drm_atomic_state *state)
+{
+	struct n72_layer *l = to_layer(dev);
+	struct drm_crtc_state *cs;
+	int ret;
+
+	ret = drm_atomic_helper_check(dev, state);
+	if (ret)
+		return ret;
+
+	cs = drm_atomic_get_new_crtc_state(state, &l->pipe.crtc);
+	if (cs && cs->color_mgmt_changed && cs->gamma_lut &&
+	    cs->gamma_lut->length != 256 * sizeof(struct drm_color_lut))
+		return -EINVAL;
+	return 0;
+}
+
 static void n72_commit_tail(struct drm_atomic_state *old_state)
 {
-	drm_atomic_helper_wait_for_fences(old_state->dev, old_state, false);
+	struct drm_device *dev = old_state->dev;
+	struct n72_layer *l = to_layer(dev);
+	struct drm_crtc *crtc = &l->pipe.crtc;
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(old_state, crtc);
+
+	drm_atomic_helper_wait_for_fences(dev, old_state, false);
 	drm_atomic_helper_wait_for_dependencies(old_state);
 	drm_atomic_helper_commit_tail(old_state);
+
+	if (cs) {
+		if (cs->color_mgmt_changed)
+			n72_clcd_apply_gamma_state(l->clcd, cs->gamma_lut);
+		if (cs->event) {
+			struct drm_pending_vblank_event *ev = cs->event;
+			unsigned long flags;
+
+			cs->event = NULL;
+			if (cs->active) {
+				n72_arm_event(l, ev, 0);
+			} else {
+				spin_lock_irqsave(&dev->event_lock, flags);
+				drm_crtc_send_vblank_event(crtc, ev);
+				spin_unlock_irqrestore(&dev->event_lock, flags);
+			}
+		}
+	}
+
 	drm_atomic_helper_commit_cleanup_done(old_state);
 	drm_atomic_state_put(old_state);
 }
@@ -620,7 +683,7 @@ err:
 
 static const struct drm_mode_config_funcs n72_mode_config_funcs = {
 	.fb_create = drm_gem_fb_create,
-	.atomic_check = drm_atomic_helper_check,
+	.atomic_check = n72_atomic_check,
 	.atomic_commit = n72_atomic_commit,
 };
 
@@ -710,6 +773,10 @@ static struct n72_layer *n72_layer_create(struct n72_clcd *p, unsigned int index
 						 DRM_MODE_ROTATE_270);
 	if (ret)
 		return ERR_PTR(ret);
+	ret = drm_mode_crtc_set_gamma_size(&l->pipe.crtc, 256);
+	if (ret)
+		return ERR_PTR(ret);
+	drm_crtc_enable_color_mgmt(&l->pipe.crtc, 0, false, 256);
 	if (!index) {
 		ret = n72_v_plane_init(l);
 		if (ret)
@@ -735,6 +802,7 @@ static int n72_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	p->dev = dev;
 	spin_lock_init(&p->reg_lock);
+	n72_clcd_init_color(p);
 	hrtimer_init(&p->vbl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	p->vbl_timer.function = n72_vbl_fn;
 
@@ -813,6 +881,83 @@ static int n72_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/* reg_lock held, registers reachable */
+static void n72_clcd_write_bg_color_locked(struct n72_clcd *p)
+{
+	u32 c = p->bg_color & 0xffffff;
+
+	writel(c, p->regs + CLCD_BG_COLOR0);
+	writel(c, p->regs + CLCD_BG_COLOR1);
+	writel(c, p->regs + CLCD_BG_COLOR2);
+}
+
+static ssize_t bg_color_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct n72_clcd *p = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 c;
+
+	spin_lock_irqsave(&p->reg_lock, flags);
+	if (p->bg_color_set || !n72_regs_ok(p))
+		c = p->bg_color & 0xffffff;
+	else
+		c = readl(p->regs + CLCD_BG_COLOR0) & 0xffffff;
+	spin_unlock_irqrestore(&p->reg_lock, flags);
+
+	return sysfs_emit(buf, "0x%06x\n", c);
+}
+
+static ssize_t bg_color_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct n72_clcd *p = dev_get_drvdata(dev);
+	unsigned long flags;
+	u32 val;
+
+	if (kstrtou32(buf, 0, &val) || val > 0xffffff)
+		return -EINVAL;
+
+	spin_lock_irqsave(&p->reg_lock, flags);
+	p->bg_color = val;
+	p->bg_color_set = true;
+	if (n72_regs_ok(p))
+		n72_clcd_write_bg_color_locked(p);
+	spin_unlock_irqrestore(&p->reg_lock, flags);
+
+	return count;
+}
+static DEVICE_ATTR_RW(bg_color);
+
+static ssize_t mie_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct n72_clcd *p = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(p->mie_mode));
+}
+
+static ssize_t mie_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct n72_clcd *p = dev_get_drvdata(dev);
+	u8 mode;
+	int ret;
+
+	if (kstrtou8(buf, 0, &mode))
+		return -EINVAL;
+	ret = n72_mie_set_mode(p, mode);
+	return ret ?: count;
+}
+static DEVICE_ATTR_RW(mie);
+
+static struct attribute *n72_clcd_attrs[] = {
+	&dev_attr_bg_color.attr,
+	&dev_attr_mie.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(n72_clcd);
+
 /* n72-lcd powers the display down or up while the system runs */
 static int n72_lcd_event(struct notifier_block *nb, unsigned long event, void *data)
 {
@@ -842,9 +987,14 @@ static int n72_lcd_event(struct notifier_block *nb, unsigned long event, void *d
 	if (event == N72_LCD_RESUMED) {
 		/* a system sleep's bring-up reset the interrupt enables */
 		spin_lock_irqsave(&p->reg_lock, flags);
-		if (p->vbl_users && n72_regs_ok(p))
-			n72_frame_irq_on(p);
+		if (n72_regs_ok(p)) {
+			if (p->bg_color_set)
+				n72_clcd_write_bg_color_locked(p);
+			if (p->vbl_users)
+				n72_frame_irq_on(p);
+		}
 		spin_unlock_irqrestore(&p->reg_lock, flags);
+		schedule_work(&p->lut_restore_work);
 		return NOTIFY_OK;
 	}
 	if (event != N72_LCD_ON)
@@ -862,6 +1012,8 @@ static int n72_lcd_event(struct notifier_block *nb, unsigned long event, void *d
 	spin_lock_irqsave(&p->reg_lock, flags);
 	WRITE_ONCE(p->blanked, false);
 	if (!READ_ONCE(p->suspended)) {
+		if (p->bg_color_set)
+			n72_clcd_write_bg_color_locked(p);
 		for (i = 0; i < N72_LAYERS; i++) {
 			struct n72_layer *l = p->layer[i];
 			struct drm_plane_state *ps = l->pipe.plane.state;
@@ -896,6 +1048,7 @@ static int n72_lcd_event(struct notifier_block *nb, unsigned long event, void *d
 	for (i = N72_LAYERS; i-- > 0;)
 		drm_modeset_unlock(&p->layer[i]->pipe.plane.mutex);
 	enable_irq(p->irq);
+	schedule_work(&p->lut_restore_work);
 	return NOTIFY_OK;
 }
 
@@ -909,6 +1062,7 @@ static void n72_remove(struct platform_device *pdev)
 	struct n72_clcd *p = platform_get_drvdata(pdev);
 	int i;
 
+	n72_clcd_fini_color(p);
 	for (i = N72_LAYERS; i-- > 0;) {
 		drm_dev_unplug(&p->layer[i]->drm);
 		drm_atomic_helper_shutdown(&p->layer[i]->drm);
@@ -921,6 +1075,7 @@ static void n72_shutdown(struct platform_device *pdev)
 	struct n72_clcd *p = platform_get_drvdata(pdev);
 	int i;
 
+	n72_clcd_fini_color(p);
 	for (i = N72_LAYERS; i-- > 0;)
 		drm_atomic_helper_shutdown(&p->layer[i]->drm);
 }
@@ -938,6 +1093,7 @@ static int n72_pm_suspend(struct device *dev)
 	}
 	n72_trace(p, "pm suspend");
 	WRITE_ONCE(p->suspended, true);
+	n72_clcd_fini_color(p);
 	hrtimer_cancel(&p->vbl_timer);
 	return ret;
 }
@@ -974,6 +1130,7 @@ static struct platform_driver n72_platform_driver = {
 		.name = "n72-clcd",
 		.of_match_table = n72_of_match,
 		.pm = pm_sleep_ptr(&n72_pm_ops),
+		.dev_groups = n72_clcd_groups,
 	},
 };
 module_platform_driver(n72_platform_driver);

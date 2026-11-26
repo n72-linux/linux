@@ -19,5 +19,5 @@ obj-$(CONFIG_TINYDRM_ST7586)		+= st7586.o
 obj-$(CONFIG_TINYDRM_ST7735R)		+= st7735r.o
 obj-$(CONFIG_TINYDRM_S5L8740) 		+= s5l8740.o
 obj-$(CONFIG_DRM_N72_LCD)		+= n72-lcd.o
-n72-clcd-drm-y				:= n72-clcd.o n72-clcd-video.o
+n72-clcd-drm-y				:= n72-clcd.o n72-clcd-video.o n72-clcd-mie.o
 obj-$(CONFIG_DRM_N72_CLCD)		+= n72-clcd-drm.o

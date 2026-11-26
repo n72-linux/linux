@@ -5,9 +5,11 @@
 
 #include <linux/hrtimer.h>
 #include <linux/io.h>
+#include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_connector.h>
 #include <drm/drm_device.h>
@@ -31,6 +33,35 @@
 #define  CLCD_L_SIZE	0x10
 #define  CLCD_L_POS	0x14
 #define  CLCD_L_1C	0x1c
+#define CLCD_BG_COLOR0	0x0064
+#define CLCD_BG_COLOR1	0x0068
+#define CLCD_BG_COLOR2	0x006c
+#define CLCD_LUT_EN	0x0400
+#define  CLCD_LUT_GAMMA_EN	BIT(0)
+#define  CLCD_LUT_MIE_EN	GENMASK(2, 1)	/* 0x6 */
+#define CLCD_LUT_IDX	0x0408
+#define  CLCD_LUT_WRITE		BIT(16)
+#define  CLCD_LUT_BANK_DEGAMMA_R 0x1000
+#define  CLCD_LUT_BANK_DEGAMMA_G 0x2000
+#define  CLCD_LUT_BANK_DEGAMMA_B 0x3000
+#define  CLCD_LUT_BANK_GAMMA_R	0x4000
+#define  CLCD_LUT_BANK_GAMMA_G	0x5000
+#define  CLCD_LUT_BANK_GAMMA_B	0x6000
+#define  CLCD_LUT_BANK_ENGAMMA	0x7000
+#define CLCD_LUT_WDATA	0x040c
+#define CLCD_LUT_RDATA	0x0410
+#define CLCD_MIE_CTRL	0x1b30
+#define CLCD_MIE_STAT	0x1b34
+#define CLCD_MIE_CFG0	0x1b38
+#define CLCD_MIE_RAMP	0x1b3c
+#define CLCD_MIE_GAIN1	0x1b50
+#define CLCD_MIE_GAIN2	0x1b58
+#define CLCD_MIE_GAIN3	0x1b60
+#define CLCD_MIE_ROI0	0x1b70
+#define CLCD_MIE_ROI1	0x1b78
+#define CLCD_MIE_CURVEX	0x1b88
+#define CLCD_MIE_CURVEY	0x1ba0
+#define CLCD_MIE_MATRIX	0x1bb8
 /* the video layer (layer 2) */
 #define CLCD_V_EN	BIT(3)			/* in 0x004: video layer enable */
 #define CLCD_V_LIMITED	BIT(8)			/* in 0x004: limited ('420v') range */
@@ -67,6 +98,7 @@
 #define CLCD_L_CFG_BASE		0x200000
 #define CLCD_L_CFG_ALPHA	0x110000	/* layer 1 premultiplied alpha */
 #define CLCD_L_CFG_RGB565	0x400
+#define CLCD_L_CFG_ARGB1555	0x500
 #define CLCD_L_CFG_ARGB4444	0x600
 #define CLCD_L_CFG_XRGB8888	0x700
 #define CLCD_SHELL_CFG		(CLCD_L_CFG_BASE | CLCD_L_CFG_XRGB8888 | CLCD_L_CFG_ALPHA)
@@ -127,6 +159,25 @@ struct n72_clcd {
 	bool video_on;			/* the video layer is enabled; reg_lock */
 	spinlock_t reg_lock;
 	struct notifier_block lcd_nb;
+
+	u32 bg_color;
+	bool bg_color_set;
+
+	struct mutex lut_lock;		/* serialises LUT RAM, MIE state and backlight */
+	struct work_struct lut_restore_work;
+	bool gamma_enabled;
+	u32 gamma_lut[3][256];
+
+	u8 mie_mode;			/* 0 = off, 1 = auto with video, 2 = on */
+	bool mie_hw_inited;
+	bool mie_active;
+	bool mie_stopping;
+	bool mie_vbl_held;
+	unsigned int mie_off_frames;
+	u32 mie_last_stat;
+	u8 mie_scale;
+	u8 mie_pending_scale;
+	struct work_struct mie_bl_work;
 };
 
 static inline struct n72_layer *to_layer(struct drm_device *drm)
@@ -151,8 +202,20 @@ static inline bool n72_scanning(struct n72_clcd *p)
 
 void n72_arm_event(struct n72_layer *l, struct drm_pending_vblank_event *event,
 		   int skip);
+void n72_frame_irq_on(struct n72_clcd *p);
+void n72_vbl_hold_mie(struct n72_clcd *p, bool hold);
 int n72_v_plane_init(struct n72_layer *l);
 void n72_v_write(struct n72_layer *l, struct drm_plane_state *ps);
 void n72_v_off(struct n72_clcd *p);
+
+struct drm_property_blob;
+void n72_clcd_init_color(struct n72_clcd *p);
+void n72_clcd_fini_color(struct n72_clcd *p);
+void n72_clcd_apply_gamma_state(struct n72_clcd *p,
+				const struct drm_property_blob *gamma_lut);
+void n72_clcd_restore_color(struct n72_clcd *p);
+void n72_mie_vblank(struct n72_clcd *p);
+void n72_mie_sync(struct n72_clcd *p);
+int n72_mie_set_mode(struct n72_clcd *p, u8 mode);
 
 #endif
