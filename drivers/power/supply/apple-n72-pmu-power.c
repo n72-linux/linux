@@ -125,6 +125,30 @@ static int n72_pmu_vbat(struct n72_pmu_power *pmu, int *mv)
 
 static int n72_pmu_bat_status(struct n72_pmu_power *pmu);
 
+static int n72_pmu_bat_cap_level(struct n72_pmu_power *pmu)
+{
+	u8 ring[4], ring_n;
+	int avg, level;
+
+	mutex_lock(&pmu->chg_lock);
+	ring_n = pmu->ring_n;
+	memcpy(ring, pmu->ring, sizeof(ring));
+	avg = pmu->avg;
+	level = pmu->level;
+	mutex_unlock(&pmu->chg_lock);
+
+	if (!ring_n || level < 0)
+		return POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
+	if (ring_n >= 4 &&
+	    ring[0] <= 2 && ring[1] <= 2 && ring[2] <= 2 && ring[3] <= 2)
+		return POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+	if (avg < 5)
+		return POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+	if (level >= 100)
+		return POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+	return POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+}
+
 static int n72_pmu_bat_get(struct power_supply *psy, enum power_supply_property psp,
 			   union power_supply_propval *val)
 {
@@ -148,6 +172,9 @@ static int n72_pmu_bat_get(struct power_supply *psy, enum power_supply_property 
 			return -ENODATA;
 		val->intval = ret;
 		return 0;
+	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+		val->intval = n72_pmu_bat_cap_level(pmu);
+		return 0;
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = n72_pmu_bat_status(pmu);
 		return 0;
@@ -167,6 +194,7 @@ static const enum power_supply_property n72_pmu_bat_props[] = {
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 	POWER_SUPPLY_PROP_TEMP,
 };
 
