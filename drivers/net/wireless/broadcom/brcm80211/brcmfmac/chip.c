@@ -966,6 +966,42 @@ u32 brcmf_chip_enum_base(u16 devid)
 	return SI_ENUM_BASE_DEFAULT;
 }
 
+/*
+ * Older silicon-backplane chips without fixed core addresses here (BCM4325):
+ * the cores sit in consecutive 4 KiB slots from the enumeration base and
+ * identify themselves in sbidhigh; chipcommon reports how many there are.
+ * The 4325 runs an ARM7TDMI (core 0x825, seen on an iPod touch 2G), held in
+ * reset and started like the 4329's Cortex-M3 (DHD treats ARM7 and ARMCM3
+ * alike), so it is registered under that core id; and its host interface is
+ * the PCMCIA core (0x80d), which DHD uses as the SDIO device core (same
+ * sdpcmd register layout), so it is registered as BCMA_CORE_SDIO_DEV.
+ */
+#define BRCMF_SB_CORE_PCMCIA	0x80d
+#define BRCMF_SB_CORE_ARM7	0x825
+
+static int brcmf_chip_sb_scan(struct brcmf_chip_priv *ci, u32 chipid)
+{
+	struct brcmf_core *core;
+	u32 n = (chipid & CID_CC_MASK) >> CID_CC_SHIFT, i, base, sbidh, id;
+
+	if (!n)
+		n = 8;
+	for (i = 0; i < n; i++) {
+		base = SI_ENUM_BASE_DEFAULT + i * 0x1000;
+		sbidh = ci->ops->read32(ci->ctx, CORE_SB(base, sbidhigh));
+		id = (sbidh & SSB_IDHIGH_CC) >> SSB_IDHIGH_CC_SHIFT;
+		if (id == BRCMF_SB_CORE_ARM7)
+			id = BCMA_CORE_ARM_CM3;
+		else if (id == BRCMF_SB_CORE_PCMCIA)
+			id = BCMA_CORE_SDIO_DEV;
+		core = brcmf_chip_add_core(ci, id, base, 0);
+		if (IS_ERR(core))
+			return PTR_ERR(core);
+		core->rev = SBCOREREV(sbidh);
+	}
+	return 0;
+}
+
 static int brcmf_chip_recognition(struct brcmf_chip_priv *ci)
 {
 	struct brcmf_core *core;
@@ -996,13 +1032,21 @@ static int brcmf_chip_recognition(struct brcmf_chip_priv *ci)
 		  socitype == SOCI_SB ? "SB" : "AXI", ci->pub.name);
 
 	if (socitype == SOCI_SB) {
-		if (ci->pub.chip != BRCM_CC_4329_CHIP_ID) {
+		if (ci->pub.chip != BRCM_CC_4329_CHIP_ID &&
+		    ci->pub.chip != BRCM_CC_4325_CHIP_ID) {
 			brcmf_err("SB chip is not supported\n");
 			return -ENODEV;
 		}
 		ci->iscoreup = brcmf_chip_sb_iscoreup;
 		ci->coredisable = brcmf_chip_sb_coredisable;
 		ci->resetcore = brcmf_chip_sb_resetcore;
+
+		if (ci->pub.chip == BRCM_CC_4325_CHIP_ID) {
+			ret = brcmf_chip_sb_scan(ci, regdata);
+			if (ret)
+				return ret;
+			goto cores_done;
+		}
 
 		core = brcmf_chip_add_core(ci, BCMA_CORE_CHIPCOMMON,
 					   SI_ENUM_BASE_DEFAULT, 0);
@@ -1031,6 +1075,7 @@ static int brcmf_chip_recognition(struct brcmf_chip_priv *ci)
 		return -ENODEV;
 	}
 
+cores_done:
 	ret = brcmf_chip_cores_check(ci);
 	if (ret)
 		return ret;

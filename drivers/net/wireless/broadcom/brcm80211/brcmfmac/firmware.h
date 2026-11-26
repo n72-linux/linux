@@ -5,6 +5,8 @@
 #ifndef BRCMFMAC_FIRMWARE_H
 #define BRCMFMAC_FIRMWARE_H
 
+#include <linux/if_ether.h>
+
 #define BRCMF_FW_REQF_OPTIONAL		0x0001
 
 #define	BRCMF_FW_NAME_LEN		320
@@ -69,6 +71,7 @@ struct brcmf_fw_request {
 	u16 bus_nr;
 	u32 n_items;
 	const char *board_types[BRCMF_FW_MAX_BOARD_TYPES];
+	u8 mac[ETH_ALEN];
 	struct brcmf_fw_item items[] __counted_by(n_items);
 };
 

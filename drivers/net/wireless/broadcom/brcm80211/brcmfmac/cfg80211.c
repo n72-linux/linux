@@ -7,6 +7,7 @@
 
 #include <linux/kernel.h>
 #include <linux/etherdevice.h>
+#include <linux/suspend.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
 #include <net/cfg80211.h>
@@ -3271,6 +3272,77 @@ brcmf_cfg80211_dump_station(struct wiphy *wiphy, struct net_device *ndev,
 	return -ENOENT;
 }
 
+/*
+ * Module profile for N72's BCM4325 (firmware 4.217.87.17) and its power-save
+ * settings (PM 2, 60 ms return-to-sleep).
+ */
+static bool brcmf_ios_setup(struct brcmf_if *ifp)
+{
+	const struct brcmf_module_data *md = ifp->drvr->settings->module;
+
+	return md && md->ios_setup;
+}
+
+static u32 brcmf_module_pm2_sleep_ret(struct brcmf_if *ifp)
+{
+	const struct brcmf_module_data *md = ifp->drvr->settings->module;
+
+	return md ? md->pm2_sleep_ret : 0;
+}
+
+/*
+ * While the system sleeps with the link up the firmware drops what should not
+ * wake it, as iOS does (configureWoWAssociatedEntry, filters in "discard on
+ * match" mode): group-addressed frames (the firmware answers ARP itself,
+ * arp_ol), ICMP and ICMPv6. Anything else for this station raises the wake
+ * line.
+ */
+#define BRCMF_IOS_FILTER_GROUP	100
+#define BRCMF_IOS_FILTER_ICMP	101
+#define BRCMF_IOS_FILTER_ICMPV6	102
+
+static void brcmf_ios_sleep_filter(struct brcmf_if *ifp, bool enable)
+{
+	static const u32 ids[] = {
+		BRCMF_IOS_FILTER_GROUP,
+		BRCMF_IOS_FILTER_ICMP,
+		BRCMF_IOS_FILTER_ICMPV6,
+	};
+	struct brcmf_pkt_filter_enable_le en;
+	int i, err;
+
+	/* 0: discard on match; 1, the firmware's default: forward on match */
+	brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode", !enable);
+	for (i = 0; i < ARRAY_SIZE(ids); i++) {
+		en.id = cpu_to_le32(ids[i]);
+		en.enable = cpu_to_le32(enable);
+		err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable", &en, sizeof(en));
+		if (err)
+			brcmf_dbg(INFO, "pkt_filter_enable %u %d: %d\n", ids[i], enable, err);
+	}
+}
+
+static void brcmf_ios_add_filter(struct brcmf_if *ifp, u32 id, u32 offset,
+				 const u8 *mask, const u8 *pattern, u32 size)
+{
+	u8 buf[sizeof(struct brcmf_pkt_filter_le) + 2 * 16] = { };
+	struct brcmf_pkt_filter_le *f = (void *)buf;
+	int err;
+
+	if (WARN_ON(size > 16))
+		return;
+	f->id = cpu_to_le32(id);
+	f->u.pattern.offset = cpu_to_le32(offset);
+	f->u.pattern.size_bytes = cpu_to_le32(size);
+	memcpy(f->u.pattern.mask_and_pattern, mask, size);
+	memcpy(f->u.pattern.mask_and_pattern + size, pattern, size);
+	err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add", f,
+				       offsetof(struct brcmf_pkt_filter_le,
+						u.pattern.mask_and_pattern) + 2 * size);
+	if (err)
+		brcmf_dbg(INFO, "pkt_filter_add %u: %d\n", id, err);
+}
+
 static s32
 brcmf_cfg80211_set_power_mgmt(struct wiphy *wiphy, struct net_device *ndev,
 			   bool enabled, s32 timeout)
@@ -3313,6 +3385,8 @@ brcmf_cfg80211_set_power_mgmt(struct wiphy *wiphy, struct net_device *ndev,
 			bphy_err(drvr, "error (%d)\n", err);
 	}
 
+	if (timeout < 0 && brcmf_module_pm2_sleep_ret(ifp))
+		timeout = brcmf_module_pm2_sleep_ret(ifp);
 	err = brcmf_fil_iovar_int_set(ifp, "pm2_sleep_ret",
 				min_t(u32, timeout, BRCMF_PS_MAX_TIMEOUT_MS));
 	if (err)
@@ -3405,8 +3479,15 @@ static s32 brcmf_inform_bss(struct brcmf_cfg80211_info *cfg)
 	int i;
 
 	bss_list = (struct brcmf_scan_results *)cfg->escan_info.escan_buf;
+	/*
+	 * Version 108 (old firmware, e.g. BCM4325 4.217.87.17 on the iPod
+	 * touch 2G) is 109 without the trailing SNR, which nothing here reads:
+	 * every field used is at the same offset and the IEs are found through
+	 * ie_offset/ie_length.
+	 */
 	if (bss_list->count != 0 &&
-	    bss_list->version != BRCMF_BSS_INFO_VERSION) {
+	    bss_list->version != BRCMF_BSS_INFO_VERSION &&
+	    bss_list->version != BRCMF_BSS_INFO_VERSION_108) {
 		bphy_err(drvr, "Version %d != WL_BSS_INFO_VERSION\n",
 			 bss_list->version);
 		return -EOPNOTSUPP;
@@ -4152,6 +4233,15 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 
 	brcmf_dbg(TRACE, "Enter\n");
 
+	if (brcmf_ios_setup(ifp) && check_vif_up(ifp->vif)) {
+		int i;
+
+		/* the bus worker marks the bus up again a moment after the thaw */
+		for (i = 0; i < 40 && cfg->pub->bus_if->state != BRCMF_BUS_UP; i++)
+			msleep(5);
+		brcmf_ios_sleep_filter(ifp, false);
+	}
+
 	if (cfg->wowl.active) {
 		brcmf_report_wowl_wakeind(wiphy, ifp);
 		brcmf_fil_iovar_int_set(ifp, "wowl_clear", 0);
@@ -4246,6 +4336,13 @@ static int brcmf_keepalive_start(struct brcmf_if *ifp, unsigned int interval)
 	return ret;
 }
 
+static bool brcmf_keep_link_s2idle(struct brcmf_if *ifp)
+{
+	const struct brcmf_module_data *md = ifp->drvr->settings->module;
+
+	return md && md->keep_link_s2idle;
+}
+
 static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 				  struct cfg80211_wowlan *wowl)
 {
@@ -4270,7 +4367,21 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	if (test_bit(BRCMF_SCAN_STATUS_BUSY, &cfg->scan_status))
 		brcmf_abort_scanning(cfg);
 
-	if (wowl == NULL) {
+	if (wowl && brcmf_ios_setup(ifp)) {
+		/*
+		 * This firmware has no "wowl". In suspend to idle stay
+		 * associated, have the firmware drop broadcasts, ICMP and
+		 * ICMPv6, and let the bus's host sleep raise the wake line
+		 * for the rest. For suspend to RAM (deep sleep), return 1 so
+		 * cfg80211 disassociates and puts the radio into MPC low power.
+		 */
+		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+			return 1;
+		brcmf_ios_sleep_filter(ifp, true);
+	} else if (wowl == NULL && pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
+		   brcmf_keep_link_s2idle(ifp)) {
+		/* nothing to do: the firmware keeps the association */
+	} else if (wowl == NULL) {
 		brcmf_bus_wowl_config(cfg->pub->bus_if, false);
 		list_for_each_entry(vif, &cfg->vif_list, list) {
 			if (!test_bit(BRCMF_VIF_STATUS_READY, &vif->sme_state))
@@ -7551,12 +7662,24 @@ static const struct wiphy_wowlan_support brcmf_wowlan_support = {
 };
 #endif
 
+#ifdef CONFIG_PM
+/* Firmware without "wowl": wake on any frame for this station, by packet filter and wake line */
+static const struct wiphy_wowlan_support brcmf_ios_wowlan_support = {
+	.flags = WIPHY_WOWLAN_ANY,
+};
+#endif
+
 static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
 {
 #ifdef CONFIG_PM
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct wiphy_wowlan_support *wowl;
+
+	if (brcmf_ios_setup(ifp)) {
+		wiphy->wowlan = &brcmf_ios_wowlan_support;
+		return;
+	}
 
 	wowl = kmemdup(&brcmf_wowlan_support, sizeof(brcmf_wowlan_support),
 		       GFP_KERNEL);
@@ -7663,7 +7786,7 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 	wiphy->vendor_commands = brcmf_vendor_cmds;
 	wiphy->n_vendor_commands = BRCMF_VNDR_CMDS_LAST - 1;
 
-	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL))
+	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL) || brcmf_ios_setup(ifp))
 		brcmf_wiphy_wowl_params(wiphy, ifp);
 	err = brcmf_fil_cmd_data_get(ifp, BRCMF_C_GET_BANDLIST, &bandlist,
 				     sizeof(bandlist));
@@ -7722,6 +7845,56 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 	return 0;
 }
 
+static void brcmf_ios_fw_setup(struct brcmf_if *ifp)
+{
+	static const struct {
+		const char *name;
+		u32 val;
+	} vars[] = {
+		{ "scan_force_active", 1 },
+		{ "pm2_refresh_badiv", 1 },	/* antenna choice refreshed in PM 2 */
+		{ "bcn_timeout", 8 },		/* link lost after 8 beacons, not 2 */
+		{ "bcn_to_dly", 1 },
+		{ "pm2_radio_shutoff_dly", 5 },
+		{ "pm2_bcn_sleep_ret", 120 },
+		{ "assoc_retry_max", 5 },
+	};
+	/* Bluetooth coexistence: iOS's air time, slave sleep time, margin, MOS */
+	static const u32 btc[][2] = {
+		{ 6, 65 }, { 8, 45000 }, { 9, 15000 }, { 10, 20000 }, { 68, 400 },
+	};
+	/* first address byte odd: group addressed */
+	static const u8 group_mask[] = { 0x01 }, group_pat[] = { 0x01 };
+	/* bytes 12..23: ethertype IPv4 and IP protocol 1 */
+	static const u8 icmp_mask[12] = { 0xff, 0xff, [11] = 0xff };
+	static const u8 icmp_pat[12] = { 0x08, 0x00, [11] = 0x01 };
+	/* bytes 12..20: ethertype IPv6 and next header 58 (ICMPv6) */
+	static const u8 icmpv6_mask[9] = { 0xff, 0xff, [8] = 0xff };
+	static const u8 icmpv6_pat[9] = { 0x86, 0xdd, [8] = 0x3a };
+	__le32 pair[2];
+	int i, err;
+
+	brcmf_ios_add_filter(ifp, BRCMF_IOS_FILTER_GROUP, 0,
+			     group_mask, group_pat, sizeof(group_mask));
+	brcmf_ios_add_filter(ifp, BRCMF_IOS_FILTER_ICMP, 12,
+			     icmp_mask, icmp_pat, sizeof(icmp_mask));
+	brcmf_ios_add_filter(ifp, BRCMF_IOS_FILTER_ICMPV6, 12,
+			     icmpv6_mask, icmpv6_pat, sizeof(icmpv6_mask));
+
+	for (i = 0; i < ARRAY_SIZE(vars); i++) {
+		err = brcmf_fil_iovar_int_set(ifp, vars[i].name, vars[i].val);
+		if (err)
+			brcmf_dbg(INFO, "%s: %d\n", vars[i].name, err);
+	}
+	for (i = 0; i < ARRAY_SIZE(btc); i++) {
+		pair[0] = cpu_to_le32(btc[i][0]);
+		pair[1] = cpu_to_le32(btc[i][1]);
+		err = brcmf_fil_iovar_data_set(ifp, "btc_params", pair, sizeof(pair));
+		if (err)
+			brcmf_dbg(INFO, "btc_params %u: %d\n", btc[i][0], err);
+	}
+}
+
 static s32 brcmf_config_dongle(struct brcmf_cfg80211_info *cfg)
 {
 	struct brcmf_pub *drvr = cfg->pub;
@@ -7759,6 +7932,16 @@ static s32 brcmf_config_dongle(struct brcmf_cfg80211_info *cfg)
 		goto default_conf_out;
 
 	brcmf_configure_arp_nd_offload(ifp, true);
+
+	if (brcmf_ios_setup(ifp)) {
+		/* iOS leaves frame bursting off */
+		brcmf_ios_fw_setup(ifp);
+		if (power_mode && brcmf_module_pm2_sleep_ret(ifp))
+			brcmf_fil_iovar_int_set(ifp, "pm2_sleep_ret",
+						brcmf_module_pm2_sleep_ret(ifp));
+		cfg->dongle_up = true;
+		return 0;
+	}
 
 	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_FAKEFRAG, 1);
 	if (err) {
@@ -8244,7 +8427,8 @@ static void brcmf_free_wiphy(struct wiphy *wiphy)
 		kfree(wiphy->bands[NL80211_BAND_5GHZ]);
 	}
 #if IS_ENABLED(CONFIG_PM)
-	if (wiphy->wowlan != &brcmf_wowlan_support)
+	if (wiphy->wowlan != &brcmf_wowlan_support &&
+	    wiphy->wowlan != &brcmf_ios_wowlan_support)
 		kfree(wiphy->wowlan);
 #endif
 }

@@ -12,6 +12,7 @@
 #include <linux/netdevice.h>
 #include <linux/interrupt.h>
 #include <linux/sched/signal.h>
+#include <linux/mmc/host.h>
 #include <linux/mmc/sdio.h>
 #include <linux/mmc/sdio_ids.h>
 #include <linux/mmc/sdio_func.h>
@@ -509,6 +510,7 @@ struct brcmf_sdio {
 	struct completion watchdog_wait;
 	struct task_struct *watchdog_tsk;
 	bool wd_active;
+	bool host_sleep;		/* asleep with the out-of-band wake line armed */
 
 	struct workqueue_struct *brcmf_wq;
 	struct work_struct datawork;
@@ -605,6 +607,7 @@ BRCMF_FW_DEF(43143, "brcmfmac43143-sdio");
 BRCMF_FW_DEF(43241B0, "brcmfmac43241b0-sdio");
 BRCMF_FW_DEF(43241B4, "brcmfmac43241b4-sdio");
 BRCMF_FW_DEF(43241B5, "brcmfmac43241b5-sdio");
+BRCMF_FW_DEF(4325, "brcmfmac4325-sdio");
 BRCMF_FW_DEF(4329, "brcmfmac4329-sdio");
 BRCMF_FW_DEF(4330, "brcmfmac4330-sdio");
 BRCMF_FW_DEF(4334, "brcmfmac4334-sdio");
@@ -637,6 +640,7 @@ static const struct brcmf_firmware_mapping brcmf_sdio_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_43241_CHIP_ID, 0x0000001F, 43241B0),
 	BRCMF_FW_ENTRY(BRCM_CC_43241_CHIP_ID, 0x00000020, 43241B4),
 	BRCMF_FW_ENTRY(BRCM_CC_43241_CHIP_ID, 0xFFFFFFC0, 43241B5),
+	BRCMF_FW_ENTRY(BRCM_CC_4325_CHIP_ID, 0xFFFFFFFF, 4325),
 	BRCMF_FW_ENTRY(BRCM_CC_4329_CHIP_ID, 0xFFFFFFFF, 4329),
 	BRCMF_FW_ENTRY(BRCM_CC_4330_CHIP_ID, 0xFFFFFFFF, 4330),
 	BRCMF_FW_ENTRY(BRCM_CC_4334_CHIP_ID, 0xFFFFFFFF, 4334),
@@ -1001,9 +1005,49 @@ brcmf_sdio_bus_sleep(struct brcmf_sdio *bus, bool sleep, bool pendok)
 end:
 	/* control clocks */
 	if (sleep) {
-		if (!bus->sr_enabled)
+		if (!bus->sr_enabled && bus->sdiodev->wake_irq_requested &&
+		    !bus->host_sleep) {
+			/*
+			 * Put the dongle into host sleep (for chips without
+			 * save/restore): tell firmware to use its out-of-band
+			 * wake line (NVRAM sd_gpout) when it has data for
+			 * the host, drop the clock request, then prevent the
+			 * chip from requesting clocks for the host.
+			 *
+			 * Used for both idle bus and system sleep so nothing
+			 * polls the card while armed.
+			 */
+			u32 addr = bus->sdio_core->base + SD_REG(tosbmailbox);
+			u32 v;
+
+			brcmf_sdio_clkctl(bus, CLK_AVAIL, false);
+			v = brcmf_sdiod_readl(bus->sdiodev, addr, &err);
+			if (!err)
+				brcmf_sdiod_writel(bus->sdiodev, addr,
+						   v | SMB_USE_OOB, &err);
+			brcmf_sdio_clkctl(bus, CLK_NONE, false);
+			brcmf_sdiod_writeb(bus->sdiodev, SBSDIO_FUNC1_CHIPCLKCSR,
+					   SBSDIO_FORCE_HW_CLKREQ_OFF, &err);
+			bus->host_sleep = true;
+			brcmf_sdiod_wake_irq_arm(bus->sdiodev, true);
+			err = 0;
+		} else if (!bus->sr_enabled) {
 			brcmf_sdio_clkctl(bus, CLK_NONE, pendok);
+		}
 	} else {
+		if (bus->host_sleep) {
+			int i;
+
+			brcmf_sdiod_wake_irq_arm(bus->sdiodev, false);
+			for (i = 0; i < 10; i++) {
+				brcmf_sdiod_writeb(bus->sdiodev,
+						   SBSDIO_FUNC1_CHIPCLKCSR, 0, &err);
+				if (!err)
+					break;
+			}
+			bus->host_sleep = false;
+			err = 0;
+		}
 		brcmf_sdio_clkctl(bus, CLK_AVAIL, pendok);
 		brcmf_sdio_wd_timer(bus, true);
 	}
@@ -3239,6 +3283,13 @@ static void brcmf_sdio_debugfs_create(struct device *dev)
 }
 #endif /* DEBUG */
 
+void brcmf_sdio_suspend_sleep(struct brcmf_sdio *bus)
+{
+	sdio_claim_host(bus->sdiodev->func1);
+	brcmf_sdio_bus_sleep(bus, true, false);
+	sdio_release_host(bus->sdiodev->func1);
+}
+
 static int
 brcmf_sdio_bus_rxctl(struct device *dev, unsigned char *msg, uint msglen)
 {
@@ -3687,6 +3738,13 @@ static void brcmf_sdio_bus_watchdog(struct brcmf_sdio *bus)
 				sdio_claim_host(bus->sdiodev->func1);
 				devpend = brcmf_sdiod_func0_rb(bus->sdiodev,
 						  SDIO_CCCR_INTx, NULL);
+				/*
+				 * An interrupt the host has signalled is on
+				 * its way (its work waits for the host we
+				 * hold): not one the poll had to find.
+				 */
+				if (bus->sdiodev->func1->card->host->sdio_irq_pending)
+					devpend = 0;
 				sdio_release_host(bus->sdiodev->func1);
 				intstatus = devpend & (INTR_STATUS_FUNC1 |
 						       INTR_STATUS_FUNC2);
@@ -3770,6 +3828,38 @@ static void brcmf_sdio_dataworker(struct work_struct *work)
 	}
 }
 
+/*
+ * The iPod touch 2G's BCM4325 module, which reports its own SDIO IDs, with
+ * Apple's firmware 4.217.87.17.
+ */
+static const struct brcmf_module_data brcmf_sdio_apple_n72 = {
+	.ios_setup = true,
+	/*
+	 * With this firmware's own roaming on, it looks for a better access
+	 * point every 2.5 s whatever the signal (-52 dBm here) and reports
+	 * each attempt (ROAM events). Every one of them wakes the system from
+	 * suspend to idle through the host wake line: with Wi-Fi associated
+	 * it never slept for more than two seconds. iOS sets its own roam
+	 * parameters from its device tree and can turn the firmware's roaming
+	 * off as well; here wpa_supplicant looks after the association.
+	 */
+	.roamoff = true,
+	.keep_link_s2idle = true,
+	.cis_mac = true,
+	/* iOS's power-save profile (bcom.ps.default): 60 ms back to sleep */
+	.pm2_sleep_ret = 60,
+	/*
+	 * The CIS gives no transfer speed (the core leaves the card at the
+	 * 400 kHz identification clock): 51.2 MHz / 2, as iOS runs it.
+	 */
+	.sdio_clock = 25600000,
+	/*
+	 * The chip's clock stays requested for 1 s after the last frame, as
+	 * iOS has it.
+	 */
+	.sdio_idle_ms = 1000,
+};
+
 static void
 brcmf_sdio_drivestrengthinit(struct brcmf_sdio_dev *sdiodev,
 			     struct brcmf_chip *ci, u32 drivestrength)
@@ -3784,6 +3874,28 @@ brcmf_sdio_drivestrengthinit(struct brcmf_sdio_dev *sdiodev,
 
 	if (!(ci->cc_caps & CC_CAP_PMU))
 		return;
+
+	/*
+	 * BCM4325: PMU chip control 1, bits 13:11 (default 12 mA unless
+	 * overridden): 0, 2, 4 mA map to sel 0, 1, 2 and 6..12 mA map to
+	 * sel 4..7. At reset default the pads are too weak above 400 kHz.
+	 */
+	if (ci->chip == BRCM_CC_4325_CHIP_ID) {
+		struct brcmf_core *pmu = brcmf_chip_get_pmu(ci);
+
+		drivestrength = min(drivestrength, 12U);
+		drivestrength_sel = drivestrength / 2 + (drivestrength >= 5);
+		brcmf_sdiod_writel(sdiodev, CORE_CC_REG(pmu->base, chipcontrol_addr),
+				   1, NULL);
+		addr = CORE_CC_REG(pmu->base, chipcontrol_data);
+		cc_data_temp = brcmf_sdiod_readl(sdiodev, addr, NULL);
+		cc_data_temp &= ~0x00003800;
+		cc_data_temp |= (drivestrength_sel & 7) << 11;
+		brcmf_sdiod_writel(sdiodev, addr, cc_data_temp, NULL);
+		brcmf_dbg(INFO, "SDIO: %d mA drive strength, chip control 1 = 0x%08x\n",
+			  drivestrength, cc_data_temp);
+		return;
+	}
 
 	switch (SDIOD_DRVSTR_KEY(ci->chip, ci->pmurev)) {
 	case SDIOD_DRVSTR_KEY(BRCM_CC_4330_CHIP_ID, 12):
@@ -3946,6 +4058,7 @@ static const struct brcmf_buscore_ops brcmf_sdio_buscore_ops = {
 static int
 brcmf_sdio_probe_attach(struct brcmf_sdio *bus)
 {
+	const struct brcmf_module_data *md = NULL;
 	struct brcmf_sdio_dev *sdiodev;
 	u8 clkctl = 0;
 	int err = 0;
@@ -4007,6 +4120,12 @@ brcmf_sdio_probe_attach(struct brcmf_sdio *bus)
 		ret = PTR_ERR_OR_ZERO(sdiodev->settings);
 		goto fail;
 	}
+	if (sdiodev->func1->vendor == SDIO_VENDOR_ID_APPLE_N72_WLAN &&
+	    sdiodev->func1->device == SDIO_DEVICE_ID_APPLE_N72_BCM4325)
+		md = &brcmf_sdio_apple_n72;
+	sdiodev->settings->module = md;
+	if (md && md->roamoff)
+		sdiodev->settings->roamoff = true;
 	/* platform specific configuration:
 	 *   alignments must be at least 4 bytes for ADMA
 	 */
@@ -4042,6 +4161,32 @@ brcmf_sdio_probe_attach(struct brcmf_sdio *bus)
 	else
 		drivestrength = DEFAULT_SDIO_DRIVE_STRENGTH;
 	brcmf_sdio_drivestrengthinit(sdiodev, bus->ci, drivestrength);
+
+	if (sdiodev->func1->device == SDIO_DEVICE_ID_APPLE_N72_BCM4325) {
+		/*
+		 * iOS puts the card in high-speed mode first thing
+		 * (IOSDIOIoCardDevice::doEnableHighSpeedMode: CCCR 0x13 bit 1
+		 * when bit 0 says it can) and runs it at 51.2 MHz / 2 from
+		 * then on, the firmware download included; its host
+		 * controller does nothing for the mode. The MMC core does not
+		 * look at that register on this card's CCCR revision.
+		 */
+		reg_val = brcmf_sdiod_func0_rb(sdiodev, SDIO_CCCR_SPEED, &err);
+		if (!err && (reg_val & SDIO_SPEED_SHS)) {
+			brcmf_sdiod_func0_wb(sdiodev, SDIO_CCCR_SPEED,
+					     reg_val | SDIO_SPEED_EHS, &err);
+			if (!err && md && md->sdio_clock &&
+			    !sdiodev->func1->card->cis.max_dtr) {
+				sdio_set_clock(sdiodev->func1, md->sdio_clock);
+				brcmf_info("high-speed mode, %u Hz\n",
+					   md->sdio_clock);
+			}
+		} else {
+			brcmf_info("no high-speed mode (CCCR 0x13 = 0x%02x, err %d)\n",
+				   reg_val, err);
+		}
+		err = 0;
+	}
 
 	/* Set card control so an SDIO card reset does a WLAN backplane reset */
 	reg_val = brcmf_sdiod_func0_rb(sdiodev, SDIO_CCCR_BRCM_CARDCTRL, &err);
@@ -4127,8 +4272,7 @@ brcmf_sdio_watchdog(struct timer_list *t)
 		complete(&bus->watchdog_wait);
 		/* Reschedule the watchdog */
 		if (bus->wd_active)
-			mod_timer(&bus->timer,
-				  jiffies + BRCMF_WD_POLL);
+			mod_timer(&bus->timer, jiffies + BRCMF_WD_POLL);
 	}
 }
 
@@ -4210,6 +4354,7 @@ static void brcmf_sdio_firmware_callback(struct device *dev, int err,
 	struct brcmf_sdio_dev *sdiod = bus_if->bus_priv.sdio;
 	struct brcmf_sdio *bus = sdiod->bus;
 	struct brcmf_core *core = bus->sdio_core;
+	const struct brcmf_module_data *md = sdiod->settings->module;
 	const struct firmware *code;
 	void *nvram;
 	u32 nvram_len;
@@ -4233,6 +4378,20 @@ static void brcmf_sdio_firmware_callback(struct device *dev, int err,
 	if (err)
 		goto fail;
 	bus->alp_only = false;
+
+	/*
+	 * The bus clock once the firmware runs, for a card whose CIS gives no
+	 * transfer speed (the core leaves those at the 400 kHz identification
+	 * clock). The iPod touch 2G's BCM4325 module: its firmware download
+	 * reads back corrupted at 12.8 MHz and faster, the running firmware
+	 * is fine.
+	 */
+	if (md && md->sdio_clock && !sdiod->func1->card->cis.max_dtr) {
+		sdio_claim_host(sdiod->func1);
+		sdio_set_clock(sdiod->func1, md->sdio_clock);
+		sdio_release_host(sdiod->func1);
+		brcmf_dbg(INFO, "SDIO clock raised to %u Hz\n", md->sdio_clock);
+	}
 
 	/* Start the watchdog timer */
 	bus->sdcnt.tickcnt = 0;
@@ -4266,6 +4425,22 @@ static void brcmf_sdio_firmware_callback(struct device *dev, int err,
 	err = sdio_enable_func(sdiod->func2);
 
 	brcmf_dbg(INFO, "enable F2: err=%d\n", err);
+#ifdef DEBUG
+	/* N72 bring-up: what the firmware says when F2 does not come up */
+	if (err) {
+		struct sdpcm_shared sh;
+
+		if (!brcmf_sdio_readshared(bus, &sh)) {
+			brcmf_err("F2 not ready: shared flags 0x%08x (version %u), console 0x%08x, mbdata 0x%08x\n",
+				  sh.flags, sh.flags & SDPCM_SHARED_VERSION_MASK,
+				  sh.console_addr,
+				  brcmf_sdiod_readl(sdiod, core->base + SD_REG(tohostmailboxdata), NULL));
+			bus->console_addr = sh.console_addr;
+			bus->console_interval = 1;
+			brcmf_sdio_readconsole(bus);
+		}
+	}
+#endif
 
 	/* If F2 successfully enabled, set core and enable interrupts */
 	if (!err) {
@@ -4302,6 +4477,18 @@ static void brcmf_sdio_firmware_callback(struct device *dev, int err,
 			brcmf_sdiod_writeb(sdiod, SBSDIO_FUNC1_MESBUSYCTRL,
 					   CY_43012_MESBUSYCTRL, &err);
 			break;
+		case SDIO_DEVICE_ID_APPLE_N72_BCM4325:
+			/*
+			 * N72 BCM4325 module setup: standard watermark of 8
+			 * and enable SFC_CRC4WOOS ("CRC error for write out
+			 * of sync") in frame control.
+			 */
+			brcmf_sdiod_writeb(sdiod, SBSDIO_WATERMARK,
+					   DEFAULT_F2_WATERMARK, &err);
+			brcmf_sdiod_writeb(sdiod, SBSDIO_FUNC1_FRAMECTRL,
+					   SFC_CRC4WOOS, &err);
+			break;
+		case SDIO_DEVICE_ID_BROADCOM_4325:
 		case SDIO_DEVICE_ID_BROADCOM_4329:
 		case SDIO_DEVICE_ID_BROADCOM_4339:
 			brcmf_dbg(INFO, "set F2 watermark to 0x%x*4 bytes\n",
@@ -4349,6 +4536,9 @@ static void brcmf_sdio_firmware_callback(struct device *dev, int err,
 					   DEFAULT_F2_WATERMARK, &err);
 			break;
 		}
+		if (md && md->sdio_idle_ms)
+			bus->idletime = DIV_ROUND_UP(md->sdio_idle_ms,
+						     jiffies_to_msecs(BRCMF_WD_POLL));
 	} else {
 		/* Disable F2 again */
 		sdio_disable_func(sdiod->func2);
@@ -4438,6 +4628,9 @@ brcmf_sdio_prepare_fw_request(struct brcmf_sdio *bus)
 	fwreq->items[BRCMF_SDIO_FW_CLM].type = BRCMF_FW_TYPE_BINARY;
 	fwreq->items[BRCMF_SDIO_FW_CLM].flags = BRCMF_FW_REQF_OPTIONAL;
 	fwreq->board_types[0] = bus->sdiodev->settings->board_type;
+	if (bus->sdiodev->settings->module &&
+	    bus->sdiodev->settings->module->cis_mac)
+		brcmf_sdiod_cis_mac(bus->sdiodev, fwreq->mac);
 
 	return fwreq;
 }

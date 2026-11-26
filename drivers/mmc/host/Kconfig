@@ -1000,6 +1000,13 @@ config MMC_TOSHIBA_PCI
 	tristate "Toshiba Type A SD/MMC Card Interface Driver"
 	depends on PCI
 
+config MMC_S5L8900_SDIO
+	tristate "Samsung/Apple S5L8900/S5L8720 SDIO host"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	help
+	  SDIO controller of the iPhone 3G and iPod touch 2G, which connects
+	  the BCM4325 Wi-Fi chip.
+
 config MMC_BCM2835
 	tristate "Broadcom BCM2835 SDHOST MMC Controller support"
 	depends on ARCH_BCM2835 || COMPILE_TEST

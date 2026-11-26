@@ -281,16 +281,22 @@ static size_t hci_uart_receive_buf(struct serdev_device *serdev,
 		return 0;
 	}
 
-	if (!test_bit(HCI_UART_PROTO_READY, &hu->flags))
-		return 0;
-
-	/* It does not need a lock here as it is already protected by a mutex in
-	 * tty caller
+	/* The tty caller's mutex keeps calls apart; proto_lock keeps them out
+	 * of hci_uart_unregister_device() once it has cleared PROTO_READY.
 	 */
+	percpu_down_read(&hu->proto_lock);
+
+	if (!test_bit(HCI_UART_PROTO_READY, &hu->flags)) {
+		percpu_up_read(&hu->proto_lock);
+		return 0;
+	}
+
 	hu->proto->recv(hu, data, count);
 
 	if (hu->hdev)
 		hu->hdev->stat.byte_rx += count;
+
+	percpu_up_read(&hu->proto_lock);
 
 	return count;
 }
@@ -395,20 +401,28 @@ EXPORT_SYMBOL_GPL(hci_uart_register_device_priv);
 void hci_uart_unregister_device(struct hci_uart *hu)
 {
 	struct hci_dev *hdev = hu->hdev;
+	bool ready;
 
 	cancel_work_sync(&hu->init_ready);
 	if (test_bit(HCI_UART_REGISTERED, &hu->flags))
 		hci_unregister_dev(hdev);
+
+	/* No reception from here on: the protocol parses into hdev and into
+	 * its own state, and both are freed below while the port is still
+	 * open (a controller that keeps sending, with a link up, got there).
+	 */
+	percpu_down_write(&hu->proto_lock);
+	ready = test_and_clear_bit(HCI_UART_PROTO_READY, &hu->flags);
+	percpu_up_write(&hu->proto_lock);
+
 	hci_free_dev(hdev);
 
 	cancel_work_sync(&hu->write_work);
 
 	hu->proto->close(hu);
 
-	if (test_bit(HCI_UART_PROTO_READY, &hu->flags)) {
-		clear_bit(HCI_UART_PROTO_READY, &hu->flags);
+	if (ready)
 		serdev_device_close(hu->serdev);
-	}
 	percpu_free_rwsem(&hu->proto_lock);
 }
 EXPORT_SYMBOL_GPL(hci_uart_unregister_device);

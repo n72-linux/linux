@@ -176,6 +176,9 @@ struct brcmf_sdio_dev {
 	struct brcmf_mp_device *settings;
 	bool oob_irq_requested;
 	bool sd_irq_requested;
+	bool wake_irq_requested;	/* host wake line, used while the bus sleeps */
+	bool wake_irq_wake;		/* enable_irq_wake() active across suspend */
+	atomic_t wake_irq_armed;
 	bool irq_en;			/* irq enable flags */
 	spinlock_t irq_en_lock;
 	bool sg_support;
@@ -363,6 +366,9 @@ void brcmf_sdio_remove(struct brcmf_sdio *bus);
 void brcmf_sdio_isr(struct brcmf_sdio *bus, bool in_isr);
 
 void brcmf_sdio_wd_timer(struct brcmf_sdio *bus, bool active);
+void brcmf_sdio_suspend_sleep(struct brcmf_sdio *bus);
+void brcmf_sdiod_wake_irq_arm(struct brcmf_sdio_dev *sdiodev, bool arm);
+int brcmf_sdiod_cis_mac(struct brcmf_sdio_dev *sdiodev, u8 *mac);
 void brcmf_sdio_wowl_config(struct device *dev, bool enabled);
 int brcmf_sdio_sleep(struct brcmf_sdio *bus, bool sleep);
 void brcmf_sdio_trigger_dpc(struct brcmf_sdio *bus);

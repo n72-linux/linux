@@ -348,10 +348,15 @@ static int bcm_request_irq(struct bcm_data *bcm)
 		goto unlock;
 	}
 
-	err = devm_request_irq(bdev->dev, bdev->irq, bcm_host_wake,
-			       bdev->irq_active_low ? IRQF_TRIGGER_FALLING :
-						      IRQF_TRIGGER_RISING,
-			       "host_wake", bdev);
+	/*
+	 * Threaded, so that the line may also come from an interrupt
+	 * controller behind a slow bus (the N72's PMU, on I2C).
+	 */
+	err = devm_request_threaded_irq(bdev->dev, bdev->irq, NULL, bcm_host_wake,
+					(bdev->irq_active_low ? IRQF_TRIGGER_FALLING :
+								IRQF_TRIGGER_RISING) |
+					IRQF_ONESHOT,
+					"host_wake", bdev);
 	if (err) {
 		bdev->irq = err;
 		goto unlock;

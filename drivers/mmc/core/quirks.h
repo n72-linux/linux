@@ -165,6 +165,13 @@ static const struct mmc_fixup __maybe_unused mmc_ext_csd_fixups[] = {
 
 
 static const struct mmc_fixup __maybe_unused sdio_fixup_methods[] = {
+	/*
+	 * iPod touch 2G BCM4325 module: its CIS has no function FUNCE, so no
+	 * max_blksize; size byte-mode transfers from the block size instead.
+	 */
+	SDIO_FIXUP(SDIO_VENDOR_ID_APPLE_N72_WLAN, SDIO_DEVICE_ID_APPLE_N72_BCM4325,
+		   add_quirk, MMC_QUIRK_BLKSZ_FOR_BYTE_MODE),
+
 	SDIO_FIXUP(SDIO_VENDOR_ID_TI_WL1251, SDIO_DEVICE_ID_TI_WL1251,
 		   add_quirk, MMC_QUIRK_NONSTD_FUNC_IF),
 

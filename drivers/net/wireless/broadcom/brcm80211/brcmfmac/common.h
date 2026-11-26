@@ -31,6 +31,30 @@ struct brcmf_mp_global_t {
 extern struct brcmf_mp_global_t brcmf_mp_global;
 
 /**
+ * struct brcmf_module_data - Fixed settings of a module, found by its bus IDs.
+ *
+ * @ios_setup: Firmware set up as Apple's iOS driver does it: its iovars and
+ *	Bluetooth coexistence values, no frame bursting, and wake-on-WLAN by
+ *	packet filters and the host wake line (the firmware has no "wowl").
+ * @roamoff: Firmware roaming off.
+ * @keep_link_s2idle: Stay associated through suspend to idle.
+ * @cis_mac: The MAC address is in the SDIO CIS only, not in the NVRAM.
+ * @pm2_sleep_ret: PM2 return-to-sleep time (ms) when none is given; 0: the
+ *	driver's default.
+ * @sdio_clock: SDIO clock (Hz) for a card whose CIS gives no transfer speed.
+ * @sdio_idle_ms: Idle time (ms) before the SDIO bus releases the HT clock.
+ */
+struct brcmf_module_data {
+	bool	ios_setup;
+	bool	roamoff;
+	bool	keep_link_s2idle;
+	bool	cis_mac;
+	u32	pm2_sleep_ret;
+	u32	sdio_clock;
+	u32	sdio_idle_ms;
+};
+
+/**
  * struct brcmf_mp_device - Device module paramaters.
  *
  * @p2p_enable: Legacy P2P0 enable (old wpa_supplicant).
@@ -41,6 +65,7 @@ extern struct brcmf_mp_global_t brcmf_mp_global;
  * @trivial_ccode_map: Assume firmware uses ISO3166 country codes with rev 0
  * @country_codes: If available, pointer to struct for translating country codes
  * @bus: Bus specific platform data. Only SDIO at the mmoment.
+ * @module: Fixed settings of this module, NULL for most.
  */
 struct brcmf_mp_device {
 	bool		p2p_enable;
@@ -59,6 +84,7 @@ struct brcmf_mp_device {
 	union {
 		struct brcmfmac_sdio_pd sdio;
 	} bus;
+	const struct brcmf_module_data *module;
 };
 
 void brcmf_c_set_joinpref_default(struct brcmf_if *ifp);

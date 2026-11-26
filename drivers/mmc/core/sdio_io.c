@@ -183,6 +183,28 @@ int sdio_set_block_size(struct sdio_func *func, unsigned blksz)
 }
 EXPORT_SYMBOL_GPL(sdio_set_block_size);
 
+/**
+ *	sdio_set_clock - set the bus clock of an initialised card
+ *	@func: SDIO function attached to host
+ *	@hz: the clock rate wanted, in Hz
+ *
+ *	The core clocks a card at the transfer speed given in its CIS, or at
+ *	the high-speed rate once it has switched the card to high speed. A
+ *	card whose CIS gives no speed, and that the core does not switch, is
+ *	given a rate of 0, which hosts that keep their divider then leave at
+ *	the identification clock. The function driver of such a card
+ *	can raise the clock with this once the card copes, for instance after
+ *	it has set up the card's pads or speed itself. The rate is capped at
+ *	the host's maximum.
+ *
+ *	The host must be claimed.
+ */
+void sdio_set_clock(struct sdio_func *func, unsigned int hz)
+{
+	mmc_set_clock(func->card->host, hz);
+}
+EXPORT_SYMBOL_GPL(sdio_set_clock);
+
 /*
  * Calculate the maximum byte mode transfer size
  */

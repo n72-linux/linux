@@ -22,6 +22,7 @@
 #include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/acpi.h>
+#include <linux/etherdevice.h>
 #include <net/cfg80211.h>
 
 #include <defs.h>
@@ -94,6 +95,37 @@ static void brcmf_sdiod_dummy_irqhandler(struct sdio_func *func)
 {
 }
 
+/*
+ * The host wake line (see brcmf_sdio_bus_sleep): armed while the bus sleeps,
+ * and switched off by its first report, since it stays asserted until the
+ * chip has been served.
+ */
+static irqreturn_t brcmf_sdiod_wake_irqhandler(int irq, void *dev_id)
+{
+	struct brcmf_bus *bus_if = dev_get_drvdata(dev_id);
+	struct brcmf_sdio_dev *sdiodev = bus_if->bus_priv.sdio;
+
+	if (atomic_xchg(&sdiodev->wake_irq_armed, 0))
+		disable_irq_nosync(irq);
+	pm_wakeup_event(dev_id, 0);
+	brcmf_sdio_isr(sdiodev->bus, true);
+	return IRQ_HANDLED;
+}
+
+void brcmf_sdiod_wake_irq_arm(struct brcmf_sdio_dev *sdiodev, bool arm)
+{
+	unsigned int irq = sdiodev->settings->bus.sdio.oob_irq_nr;
+
+	if (!sdiodev->wake_irq_requested)
+		return;
+	if (arm) {
+		if (!atomic_xchg(&sdiodev->wake_irq_armed, 1))
+			enable_irq(irq);
+	} else if (atomic_xchg(&sdiodev->wake_irq_armed, 0)) {
+		disable_irq_nosync(irq);
+	}
+}
+
 int brcmf_sdiod_intr_register(struct brcmf_sdio_dev *sdiodev)
 {
 	struct brcmfmac_sdio_pd *pdata;
@@ -155,6 +187,19 @@ int brcmf_sdiod_intr_register(struct brcmf_sdio_dev *sdiodev)
 		sdio_release_host(sdiodev->func1);
 	} else {
 		brcmf_dbg(SDIO, "Entering\n");
+		if (pdata->oob_wake_only && !sdiodev->wake_irq_requested) {
+			atomic_set(&sdiodev->wake_irq_armed, 0);
+			irq_set_status_flags(pdata->oob_irq_nr, IRQ_NOAUTOEN);
+			ret = request_threaded_irq(pdata->oob_irq_nr, NULL,
+						   brcmf_sdiod_wake_irqhandler,
+						   pdata->oob_irq_flags | IRQF_ONESHOT,
+						   "brcmf_host_wake",
+						   &sdiodev->func1->dev);
+			if (ret)
+				brcmf_err("host wake irq: %d\n", ret);
+			else
+				sdiodev->wake_irq_requested = true;
+		}
 		sdio_claim_host(sdiodev->func1);
 		sdio_claim_irq(sdiodev->func1, brcmf_sdiod_ib_irqhandler);
 		sdio_claim_irq(sdiodev->func2, brcmf_sdiod_dummy_irqhandler);
@@ -167,6 +212,12 @@ int brcmf_sdiod_intr_register(struct brcmf_sdio_dev *sdiodev)
 
 void brcmf_sdiod_intr_unregister(struct brcmf_sdio_dev *sdiodev)
 {
+	if (sdiodev->wake_irq_requested) {
+		brcmf_sdiod_wake_irq_arm(sdiodev, false);
+		free_irq(sdiodev->settings->bus.sdio.oob_irq_nr,
+			 &sdiodev->func1->dev);
+		sdiodev->wake_irq_requested = false;
+	}
 
 	brcmf_dbg(SDIO, "Entering oob=%d sd=%d\n",
 		  sdiodev->oob_irq_requested,
@@ -897,6 +948,55 @@ static void brcmf_sdiod_host_fixup(struct mmc_host *host)
 	host->caps |= MMC_CAP_NONREMOVABLE;
 }
 
+/*
+ * Some modules (the iPod touch 2G's BCM4325) keep their MAC address only in
+ * the SDIO CIS, as a CISTPL_FUNCE LAN node ID (0x22, 04 06 <mac>), with no
+ * macaddr in the NVRAM; the firmware then refuses to bring the radio up.
+ * For those the firmware request carries it (brcmf_sdiod_cis_mac), and when
+ * the platform gives no address the NVRAM code adds it as macaddr=.
+ */
+static bool brcmf_sdiod_lan_nid(const u8 *t, unsigned int len, u8 *mac)
+{
+	if (len < 8 || t[0] != 0x04 || t[1] != ETH_ALEN || !is_valid_ether_addr(t + 2))
+		return false;
+	ether_addr_copy(mac, t + 2);
+	return true;
+}
+
+int brcmf_sdiod_cis_mac(struct brcmf_sdio_dev *sdiodev, u8 *mac)
+{
+	struct sdio_func *func = sdiodev->func1;
+	struct sdio_func_tuple *tpl;
+	u8 code, len, buf[8];
+	u32 ptr = 0, end;
+	int i, err = 0;
+
+	for (tpl = func->card->tuples; tpl; tpl = tpl->next)
+		if (tpl->code == 0x22 && brcmf_sdiod_lan_nid(tpl->data, tpl->size, mac))
+			return 0;
+
+	/* not kept by the core: walk the common CIS (function 0) */
+	sdio_claim_host(func);
+	for (i = 0; i < 3 && !err; i++)
+		ptr |= sdio_f0_readb(func, SDIO_CCCR_CIS + i, &err) << (8 * i);
+	for (end = ptr + 256; !err && ptr && ptr < end; ptr += 2 + len) {
+		code = sdio_f0_readb(func, ptr, &err);
+		if (err || code == 0xff)
+			break;
+		len = sdio_f0_readb(func, ptr + 1, &err);
+		if (code != 0x22 || len < sizeof(buf))
+			continue;
+		for (i = 0; i < sizeof(buf) && !err; i++)
+			buf[i] = sdio_f0_readb(func, ptr + 2 + i, &err);
+		if (!err && brcmf_sdiod_lan_nid(buf, sizeof(buf), mac)) {
+			sdio_release_host(func);
+			return 0;
+		}
+	}
+	sdio_release_host(func);
+	return -ENOENT;
+}
+
 int brcmf_sdiod_probe(struct brcmf_sdio_dev *sdiodev)
 {
 	int ret = 0;
@@ -919,6 +1019,11 @@ int brcmf_sdiod_probe(struct brcmf_sdio_dev *sdiodev)
 	case SDIO_DEVICE_ID_BROADCOM_4356:
 		f2_blksz = SDIO_435X_FUNC2_BLOCKSIZE;
 		break;
+	case SDIO_DEVICE_ID_APPLE_N72_BCM4325:
+		/* iOS: 64-byte blocks on function 2 as on function 1 */
+		f2_blksz = SDIO_FUNC1_BLOCKSIZE;
+		break;
+	case SDIO_DEVICE_ID_BROADCOM_4325:
 	case SDIO_DEVICE_ID_BROADCOM_4329:
 		f2_blksz = SDIO_4329_FUNC2_BLOCKSIZE;
 		break;
@@ -954,6 +1059,8 @@ int brcmf_sdiod_probe(struct brcmf_sdio_dev *sdiodev)
 	sdiodev->bus = brcmf_sdio_probe(sdiodev);
 	if (IS_ERR(sdiodev->bus)) {
 		ret = PTR_ERR(sdiodev->bus);
+		/* brcmf_sdiod_remove() only checks the bus for NULL */
+		sdiodev->bus = NULL;
 		goto out;
 	}
 	brcmf_sdiod_host_fixup(sdiodev->func2->card->host);
@@ -980,6 +1087,11 @@ out:
 static const struct sdio_device_id brcmf_sdmmc_ids[] = {
 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_43143, WCC),
 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_43241, WCC),
+	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4325, WCC),
+	{
+		SDIO_DEVICE(SDIO_VENDOR_ID_APPLE_N72_WLAN, SDIO_DEVICE_ID_APPLE_N72_BCM4325),
+		.driver_data = BRCMF_FWVENDOR_WCC
+	},
 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4329, WCC),
 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4330, WCC),
 	BRCMF_SDIO_DEVICE(SDIO_DEVICE_ID_BROADCOM_4334, WCC),
@@ -1188,6 +1300,20 @@ static int brcmf_ops_sdio_suspend(struct device *dev)
 	if (sdiodev->wowl_enabled || !cap_power_off) {
 		brcmf_sdiod_freezer_on(sdiodev);
 		brcmf_sdio_wd_timer(sdiodev->bus, 0);
+		if (sdiodev->wake_irq_requested) {
+			/*
+			 * Put the bus into host sleep; only suspend to idle
+			 * leaves the wake line armed to wake the system.
+			 */
+			brcmf_sdio_suspend_sleep(sdiodev->bus);
+			if (pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+				enable_irq_wake(sdiodev->settings->bus.sdio.oob_irq_nr);
+				sdiodev->wake_irq_wake = true;
+			} else {
+				brcmf_sdiod_wake_irq_arm(sdiodev, false);
+				synchronize_irq(sdiodev->settings->bus.sdio.oob_irq_nr);
+			}
+		}
 
 		sdio_flags = MMC_PM_KEEP_POWER;
 
@@ -1232,6 +1358,10 @@ static int brcmf_ops_sdio_resume(struct device *dev)
 	} else {
 		if (sdiodev->wowl_enabled && sdiodev->settings->bus.sdio.oob_irq_supported)
 			disable_irq_wake(sdiodev->settings->bus.sdio.oob_irq_nr);
+		if (sdiodev->wake_irq_wake) {
+			disable_irq_wake(sdiodev->settings->bus.sdio.oob_irq_nr);
+			sdiodev->wake_irq_wake = false;
+		}
 
 		brcmf_sdiod_freezer_off(sdiodev);
 	}

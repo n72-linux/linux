@@ -147,6 +147,18 @@ int brcmf_of_probe(struct device *dev, enum brcmf_bus_type bus_type,
 	}
 	irqf = irq_get_trigger_type(irq);
 
+	/*
+	 * A host wake line that is too slow to be the data interrupt (behind
+	 * an I2C PMU on the iPod touch 2G): the SDIO interrupt stays, the
+	 * line is used while the bus sleeps.
+	 */
+	if (of_property_read_bool(np, "apple,host-wake-only")) {
+		sdio->oob_wake_only = true;
+		sdio->oob_irq_nr = irq;
+		sdio->oob_irq_flags = irqf;
+		return 0;
+	}
+
 	sdio->oob_irq_supported = true;
 	sdio->oob_irq_nr = irq;
 	sdio->oob_irq_flags = irqf;

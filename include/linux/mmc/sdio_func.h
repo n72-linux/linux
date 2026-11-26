@@ -134,6 +134,7 @@ extern int sdio_enable_func(struct sdio_func *func);
 extern int sdio_disable_func(struct sdio_func *func);
 
 extern int sdio_set_block_size(struct sdio_func *func, unsigned blksz);
+extern void sdio_set_clock(struct sdio_func *func, unsigned int hz);
 
 extern int sdio_claim_irq(struct sdio_func *func, sdio_irq_handler_t *handler);
 extern int sdio_release_irq(struct sdio_func *func);

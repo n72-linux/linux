@@ -4,6 +4,9 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/unaligned.h>
+#include <linux/seq_file.h>
+#include <linux/debugfs.h>
 #include <linux/etherdevice.h>
 #include <linux/module.h>
 #include <linux/inetdevice.h>
@@ -1191,6 +1194,7 @@ static const struct file_operations bus_reset_fops = {
 	.open	= simple_open,
 	.write	= bus_reset_write,
 };
+
 
 static int brcmf_bus_started(struct brcmf_pub *drvr, struct cfg80211_ops *ops)
 {

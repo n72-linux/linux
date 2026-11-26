@@ -92,6 +92,7 @@ struct brcmfmac_sdio_pd {
 	int		txglomsz;
 	unsigned int	drive_strength;
 	bool		oob_irq_supported;
+	bool		oob_wake_only;	/* the line only wakes a sleeping bus (oob_irq_nr) */
 	unsigned int	oob_irq_nr;
 	unsigned long	oob_irq_flags;
 	bool		broken_sg_support;

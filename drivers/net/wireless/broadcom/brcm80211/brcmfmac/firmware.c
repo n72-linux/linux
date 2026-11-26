@@ -7,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/device.h>
+#include <linux/etherdevice.h>
 #include <linux/firmware.h>
 #include <linux/module.h>
 #include <linux/bcm47xx_nvram.h>
@@ -394,7 +395,7 @@ static void brcmf_fw_add_macaddr(struct nvram_parser *nvp, u8 *mac)
  */
 static void *brcmf_fw_nvram_strip(const u8 *data, size_t data_len,
 				  u32 *new_length, u16 domain_nr, u16 bus_nr,
-				  struct device *dev)
+				  struct device *dev, const u8 *bus_mac)
 {
 	struct nvram_parser nvp;
 	u32 pad;
@@ -405,8 +406,13 @@ static void *brcmf_fw_nvram_strip(const u8 *data, size_t data_len,
 	if (brcmf_init_nvram_parser(&nvp, data, data_len) < 0)
 		return NULL;
 
-	if (eth_platform_get_mac_address(dev, mac) == 0)
+	if (eth_platform_get_mac_address(dev, mac) == 0) {
 		nvp.strip_mac = true;
+	} else if (is_valid_ether_addr(bus_mac)) {
+		/* SDIO modules that keep their address only in the CIS (bcmsdh.c) */
+		ether_addr_copy(mac, bus_mac);
+		nvp.strip_mac = true;
+	}
 
 	while (nvp.pos < data_len) {
 		nvp.state = nv_parser_states[nvp.state](&nvp);
@@ -566,7 +572,7 @@ static int brcmf_fw_request_nvram_done(const struct firmware *fw, void *ctx)
 		nvram = brcmf_fw_nvram_strip(data, data_len, &nvram_length,
 					     fwctx->req->domain_nr,
 					     fwctx->req->bus_nr,
-					     fwctx->dev);
+					     fwctx->dev, fwctx->req->mac);
 
 	if (free_bcm47xx_nvram)
 		bcm47xx_nvram_release_contents(data);
