@@ -126,6 +126,35 @@ static void dwc2_set_s5l8702_params(struct dwc2_hsotg *hsotg)
 	// this gating, these bits fire during disconnect and the OTG state
 	// machine has no opportunity to make progress.
 	p->session_valid_gintmsk_quirk = true;
+	// Keep the core awake through a bus suspend. The hardware reports
+	// power_optimized, so dwc2 would enter partial power down when the
+	// bus goes idle, which is also what pulling the cable looks like.
+	// Nothing brings the core back from it here (seen on the N72: PCGCCTL
+	// stays 0xd and the session never revalidates on replug), so the
+	// gadget stayed dead until the driver was rebound.
+	p->power_down = DWC2_POWER_DOWN_PARAM_NONE;
+	p->no_clock_gating = true;
+	p->bus_reset_to_l0 = true;
+}
+
+/*
+ * iPod touch 2G (S5L8720): the core's buffer DMA (GAHBCFG 0x2b, fixed
+ * 8-beat bursts, never descriptor DMA). The "bulk corruption" in
+ * dwc2_set_s5l8702_params() was seen on the S5L8702 with undefined-length
+ * bursts; INCR8 cures it here.
+ */
+static void dwc2_set_s5l8720_params(struct dwc2_hsotg *hsotg)
+{
+	struct dwc2_core_params *p = &hsotg->params;
+
+	dwc2_set_s5l8702_params(hsotg);
+	p->g_dma = true;
+	p->g_dma_desc = false;
+	p->ahbcfg = GAHBCFG_HBSTLEN_INCR8 << GAHBCFG_HBSTLEN_SHIFT;
+	p->g_dma_addr_on_continue = true;
+	p->g_dma_nak_idle_out = true;
+	p->g_dma_out_whole_packets = true;
+	p->g_dma_avoids_skb_reserve = true;
 }
 
 static void dwc2_set_socfpga_agilex_params(struct dwc2_hsotg *hsotg)
@@ -344,6 +373,8 @@ const struct of_device_id dwc2_of_match_table[] = {
 	{ .compatible = "snps,dwc2" },
 	{ .compatible = "samsung,s3c6400-hsotg",
 	  .data = dwc2_set_s3c6400_params },
+	{ .compatible = "apple,s5l8720-usb",
+	  .data = dwc2_set_s5l8720_params },
 	{ .compatible = "apple,s5l87xx-usb",
 	  .data = dwc2_set_s5l8702_params },
 	{ .compatible = "amlogic,meson8-usb",

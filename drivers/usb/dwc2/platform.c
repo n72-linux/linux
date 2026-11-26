@@ -5,6 +5,7 @@
  * Copyright (C) Matthijs Kooijman <matthijs@stdin.nl>
  */
 
+#include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -14,6 +15,8 @@
 #include <linux/of.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/power_supply.h>
+#include <linux/workqueue.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_data/s3c-hsotg.h>
 #include <linux/reset.h>
@@ -25,6 +28,8 @@
 #include "debug.h"
 
 static const char dwc2_driver_name[] = "dwc2";
+
+DEFINE_STATIC_KEY_FALSE(dwc2_regs_gate_key);
 
 /*
  * Check the dr_mode against the module configuration and hardware
@@ -91,6 +96,43 @@ static int dwc2_get_dr_mode(struct dwc2_hsotg *hsotg)
 	return 0;
 }
 
+/*
+ * Start the PHY clock and ungate HCLK in PCGCCTL. After a suspend that cut
+ * the SoC's power the register comes back with both set (Apple S5L8720:
+ * 3), the PHY's PLL never starts and the core cannot even enter device
+ * mode; Apple's boot loader clears them before it powers the PHY on. A
+ * no-op when they are already clear.
+ */
+static void dwc2_ungate_phy_clock(struct dwc2_hsotg *hsotg)
+{
+	u32 pcgctl;
+
+	if (!hsotg->ungate_pcgctl)
+		return;
+
+	pcgctl = dwc2_readl(hsotg, PCGCTL);
+
+	/*
+	 * A kernel that kexec'd us may also have left the core in partial
+	 * power down (PWRCLMP | RSTPDWNMODULE | STOPPCLK, 0xd): then it does
+	 * not even answer GSNPSID. Leave it in the order
+	 * dwc2_exit_partial_power_down() does: clamp, module reset, clocks.
+	 */
+	if (pcgctl & PCGCTL_PWRCLMP) {
+		pcgctl &= ~PCGCTL_PWRCLMP;
+		dwc2_writel(hsotg, pcgctl, PCGCTL);
+		udelay(5);
+	}
+	if (pcgctl & PCGCTL_RSTPDWNMODULE) {
+		pcgctl &= ~PCGCTL_RSTPDWNMODULE;
+		dwc2_writel(hsotg, pcgctl, PCGCTL);
+		udelay(5);
+	}
+	if (pcgctl & (PCGCTL_STOPPCLK | PCGCTL_GATEHCLK))
+		dwc2_writel(hsotg, pcgctl & ~(PCGCTL_STOPPCLK | PCGCTL_GATEHCLK),
+			    PCGCTL);
+}
+
 static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
 {
 	struct platform_device *pdev = to_platform_device(hsotg->dev);
@@ -112,6 +154,10 @@ static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
 		if (ret)
 			goto err_dis_utmi_clk;
 	}
+	if (hsotg->clk_gate_hangs_bus)
+		WRITE_ONCE(hsotg->regs_gated, false);
+
+	dwc2_ungate_phy_clock(hsotg);
 
 	if (hsotg->uphy) {
 		ret = usb_phy_init(hsotg->uphy);
@@ -132,6 +178,8 @@ static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
 	return 0;
 
 err_dis_clk:
+	if (hsotg->clk_gate_hangs_bus)
+		WRITE_ONCE(hsotg->regs_gated, true);
 	if (hsotg->clk)
 		clk_disable_unprepare(hsotg->clk);
 
@@ -178,6 +226,8 @@ static int __dwc2_lowlevel_hw_disable(struct dwc2_hsotg *hsotg)
 	if (ret)
 		return ret;
 
+	if (hsotg->clk_gate_hangs_bus)
+		WRITE_ONCE(hsotg->regs_gated, true);
 	if (hsotg->clk)
 		clk_disable_unprepare(hsotg->clk);
 
@@ -203,9 +253,89 @@ int dwc2_lowlevel_hw_disable(struct dwc2_hsotg *hsotg)
 	return ret;
 }
 
+/*
+ * VBUS from a power supply (Apple S5L8720: the PMU's "usb" supply, whose
+ * plug and unplug interrupts call power_supply_changed()). With the cable
+ * out the gadget is stopped, the PHY powered down and the core's clock
+ * gated, as iOS gates USB OTG when nothing is connected; with it back in,
+ * the reverse. Only while the gadget runs (lowlevel hw enabled).
+ */
+static void dwc2_vbus_work(struct work_struct *work)
+{
+	struct dwc2_hsotg *hsotg = container_of(work, struct dwc2_hsotg, vbus_work);
+	union power_supply_propval val = { .intval = 1 };
+	struct power_supply *psy;
+	bool on;
+
+	psy = power_supply_get_by_name(hsotg->vbus_psy_name);
+	if (!psy)
+		return;
+	power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val);
+	power_supply_put(psy);
+	on = val.intval;
+
+	mutex_lock(&hsotg->vbus_lock);
+	if (hsotg->vbus_frozen) {
+		/* resume looks again */
+	} else if (!on && !hsotg->vbus_off && hsotg->ll_hw_enabled) {
+		dwc2_hsotg_vbus_off(hsotg);
+		disable_irq(hsotg->irq);
+		if (__dwc2_lowlevel_hw_disable(hsotg)) {
+			enable_irq(hsotg->irq);
+			dwc2_hsotg_vbus_on(hsotg);
+		} else {
+			hsotg->vbus_off = true;
+			dev_info(hsotg->dev, "cable out: gadget stopped, core gated\n");
+		}
+	} else if (on && hsotg->vbus_off) {
+		if (__dwc2_lowlevel_hw_enable(hsotg)) {
+			dev_err(hsotg->dev, "cable in, but the core did not come up\n");
+		} else {
+			hsotg->vbus_off = false;
+			enable_irq(hsotg->irq);
+			dwc2_force_dr_mode(hsotg);
+			dwc2_hsotg_vbus_on(hsotg);
+			dev_info(hsotg->dev, "cable in: core up, gadget started\n");
+		}
+	}
+	mutex_unlock(&hsotg->vbus_lock);
+}
+
+static int dwc2_vbus_notify(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct dwc2_hsotg *hsotg = container_of(nb, struct dwc2_hsotg, vbus_nb);
+	struct power_supply *psy = data;
+
+	if (event == PSY_EVENT_PROP_CHANGED &&
+	    !strcmp(psy->desc->name, hsotg->vbus_psy_name))
+		schedule_work(&hsotg->vbus_work);
+	return NOTIFY_OK;
+}
+
+/* Back to a clocked, running core (before remove or a suspend that needs it). */
+static void dwc2_vbus_stop(struct dwc2_hsotg *hsotg)
+{
+	if (!hsotg->vbus_psy_name)
+		return;
+	power_supply_unreg_notifier(&hsotg->vbus_nb);
+	cancel_work_sync(&hsotg->vbus_work);
+	mutex_lock(&hsotg->vbus_lock);
+	if (hsotg->vbus_off && !__dwc2_lowlevel_hw_enable(hsotg)) {
+		hsotg->vbus_off = false;
+		enable_irq(hsotg->irq);
+	}
+	mutex_unlock(&hsotg->vbus_lock);
+	hsotg->vbus_psy_name = NULL;
+}
+
 static void dwc2_reset_control_assert(void *data)
 {
 	reset_control_assert(data);
+}
+
+static void dwc2_regs_gate_key_put(void *data)
+{
+	static_branch_dec(&dwc2_regs_gate_key);
 }
 
 static int dwc2_lowlevel_hw_init(struct dwc2_hsotg *hsotg)
@@ -278,6 +408,24 @@ static int dwc2_lowlevel_hw_init(struct dwc2_hsotg *hsotg)
 		return dev_err_probe(hsotg->dev, PTR_ERR(hsotg->utmi_clk),
 				     "cannot get utmi clock\n");
 
+	/*
+	 * Apple S5L87xx: "otg" gates the core's bus clock, and the boot loader
+	 * or a kernel that kexec'd us can leave PCGCTL set. Both matter from
+	 * the first register access on, before the parameters are known.
+	 */
+	if (of_device_is_compatible(hsotg->dev->of_node, "apple,s5l87xx-usb")) {
+		hsotg->ungate_pcgctl = true;
+		if (hsotg->clk) {
+			hsotg->clk_gate_hangs_bus = true;
+			static_branch_inc(&dwc2_regs_gate_key);
+			ret = devm_add_action_or_reset(hsotg->dev,
+						       dwc2_regs_gate_key_put,
+						       NULL);
+			if (ret)
+				return ret;
+		}
+	}
+
 	/* Regulators */
 	for (i = 0; i < ARRAY_SIZE(hsotg->supplies); i++)
 		hsotg->supplies[i].supply = dwc2_hsotg_supply_names[i];
@@ -307,6 +455,7 @@ static void dwc2_driver_remove(struct platform_device *dev)
 	struct dwc2_gregs_backup *gr;
 	int ret = 0;
 
+	dwc2_vbus_stop(hsotg);
 	gr = &hsotg->gr_backup;
 
 	/* Exit Hibernation when driver is removed. */
@@ -622,6 +771,18 @@ static int dwc2_driver_probe(struct platform_device *dev)
 		}
 	}
 #endif /* CONFIG_USB_DWC2_PERIPHERAL || CONFIG_USB_DWC2_DUAL_ROLE */
+
+	if (hsotg->dr_mode == USB_DR_MODE_PERIPHERAL &&
+	    !of_property_read_string(dev->dev.of_node, "apple,vbus-psy-name",
+				     &hsotg->vbus_psy_name)) {
+		mutex_init(&hsotg->vbus_lock);
+		INIT_WORK(&hsotg->vbus_work, dwc2_vbus_work);
+		hsotg->vbus_nb.notifier_call = dwc2_vbus_notify;
+		if (power_supply_reg_notifier(&hsotg->vbus_nb))
+			hsotg->vbus_psy_name = NULL;
+		else
+			schedule_work(&hsotg->vbus_work);	/* the state now */
+	}
 	return 0;
 
 #if IS_ENABLED(CONFIG_USB_DWC2_PERIPHERAL) || \
@@ -646,9 +807,19 @@ error:
 static int __maybe_unused dwc2_suspend(struct device *dev)
 {
 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
-	bool is_device_mode = dwc2_is_device_mode(dwc2);
+	bool is_device_mode;
 	int ret = 0;
 
+	if (dwc2->vbus_psy_name) {
+		/* no cable changes until resume; cable out: already stopped and gated */
+		mutex_lock(&dwc2->vbus_lock);
+		dwc2->vbus_frozen = true;
+		mutex_unlock(&dwc2->vbus_lock);
+		if (dwc2->vbus_off)
+			return 0;
+	}
+
+	is_device_mode = dwc2_is_device_mode(dwc2);
 	if (is_device_mode)
 		dwc2_hsotg_suspend(dwc2);
 
@@ -699,6 +870,17 @@ static int __maybe_unused dwc2_resume(struct device *dev)
 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
 	int ret = 0;
 
+	if (dwc2->vbus_psy_name) {
+		mutex_lock(&dwc2->vbus_lock);
+		dwc2->vbus_frozen = false;
+		mutex_unlock(&dwc2->vbus_lock);
+		/* a cable change while asleep: look again */
+		schedule_work(&dwc2->vbus_work);
+		if (dwc2->vbus_off)
+			return 0;
+	}
+
+	dwc2_ungate_phy_clock(dwc2);
 	if (dwc2->phy_off_for_suspend && dwc2->ll_hw_enabled) {
 		ret = __dwc2_lowlevel_hw_enable(dwc2);
 		if (ret)

@@ -626,6 +626,20 @@ static int dwc2_hsotg_write_fifo(struct dwc2_hsotg *hsotg,
 			to_write -= pkt_round;
 
 		/*
+		 * Report when not even one packet fits. This is ordinary flow
+		 * control under bulk load, so debug level only.
+		 */
+		if (!to_write)
+			dev_dbg_ratelimited(hsotg->dev,
+				"ep%d fifo%d: can %d < max %d, DTXFSTS %08x DPTXFSIZ %08x\n",
+				hs_ep->index, hs_ep->fifo_index, can_write,
+				max_transfer,
+				hsotg->dedicated_fifos && hs_ep->index ?
+				dwc2_readl(hsotg, DTXFSTS(hs_ep->fifo_index)) : 0,
+				hs_ep->fifo_index ?
+				dwc2_readl(hsotg, DPTXFSIZN(hs_ep->fifo_index)) : 0);
+
+		/*
 		 * enable correct FIFO interrupt to alert us when there
 		 * is more room left.
 		 */
@@ -1174,13 +1188,20 @@ static void dwc2_hsotg_start_req(struct dwc2_hsotg *hsotg,
 		/* write size / packets */
 		dwc2_writel(hsotg, epsize, epsize_reg);
 
-		if (using_dma(hsotg) && !continuing && (length != 0)) {
+		if (using_dma(hsotg) && (length != 0) &&
+		    (!continuing || hsotg->params.g_dma_addr_on_continue)) {
 			/*
 			 * write DMA address to control register, buffer
-			 * already synced by dwc2_hsotg_ep_queue().
+			 * already synced by dwc2_hsotg_ep_queue(). Also when
+			 * continuing (EP0 replies longer than a packet), where
+			 * g_dma_addr_on_continue says so: where the request
+			 * has got to, rather than relying on the core having
+			 * advanced the register (iOS and U-Boot write it at
+			 * every programming on the S5L8720).
 			 */
 
-			dwc2_writel(hsotg, ureq->dma, dma_reg);
+			dwc2_writel(hsotg, ureq->dma + (continuing ? ureq->actual : 0),
+				    dma_reg);
 
 			dev_dbg(hsotg->dev, "%s: %pad => 0x%08x\n",
 				__func__, &ureq->dma, dma_reg);
@@ -1754,8 +1775,13 @@ static void dwc2_gadget_start_next_request(struct dwc2_hsotg_ep *hs_ep)
 		dwc2_hsotg_start_req(hsotg, hs_ep, hs_req, false);
 		return;
 	}
-	if (!hs_ep->isochronous)
+	if (!hs_ep->isochronous) {
+		/* nothing to receive into: NAK (see dwc2_hsotg_ep_enable()) */
+		if (!dir_in && hs_ep->index && using_dma(hsotg) &&
+		    !using_desc_dma(hsotg) && hsotg->params.g_dma_nak_idle_out)
+			dwc2_set_bit(hsotg, DOEPCTL(hs_ep->index), DXEPCTL_SNAK);
 		return;
+	}
 
 	if (dir_in) {
 		dev_dbg(hsotg->dev, "%s: No more ISOC-IN requests\n",
@@ -3799,6 +3825,21 @@ irq_retry:
 
 		if (usb_status & GOTGCTL_BSESVLD && connected)
 			dwc2_hsotg_core_init_disconnected(hsotg, true);
+
+		/*
+		 * A bus reset means the link is active again. After a cable
+		 * pull the link is left in L3 (session end, disconnect) or L2
+		 * (the idle bus looked like a suspend), and on the first reset
+		 * after the replug the core is not re-initialised above, since
+		 * it is not "connected" yet. Without partial power down or
+		 * clock gating to exit, nothing else moves it back to L0, so
+		 * ep0 refused its setup request (-EAGAIN) on every reset and
+		 * the host never enumerated the gadget.
+		 */
+		if (hsotg->params.bus_reset_to_l0 &&
+		    (hsotg->lx_state == DWC2_L2 || hsotg->lx_state == DWC2_L3) &&
+		    !hsotg->in_ppd && !hsotg->bus_suspended)
+			hsotg->lx_state = DWC2_L0;
 	}
 
 	if (gintsts & GINTSTS_ENUMDONE) {
@@ -4141,6 +4182,20 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 	 * transactions entirely for this endpoint
 	 */
 	epctrl |= DXEPCTL_USBACTEP;
+
+	/*
+	 * Buffer DMA: an OUT endpoint NAKs until a request arms it
+	 * (dwc2_hsotg_start_req() clears the NAK). Otherwise the core takes a
+	 * packet for it into the RX FIFO, which is shared and drained in
+	 * order, and with no buffer to move it to, everything behind it waits:
+	 * the SETUPs too, so the host retries them, they pile up behind the
+	 * status stage of the one that got through, and the link hangs. Seen
+	 * with g_ether when the host sends before usb0 is opened. Isochronous
+	 * OUT gets its NAK below already.
+	 */
+	if (!dir_in && using_dma(hsotg) && !using_desc_dma(hsotg) &&
+	    hsotg->params.g_dma_nak_idle_out)
+		epctrl |= DXEPCTL_SNAK;
 
 	/* update the endpoint state */
 	dwc2_hsotg_set_ep_maxpacket(hsotg, hs_ep->index, mps, mc, dir_in);
@@ -5039,6 +5094,21 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 
 	hsotg->gadget.ops = &dwc2_hsotg_gadget_ops;
 	hsotg->gadget.name = dev_name(dev);
+	/*
+	 * With DMA a packet longer than the buffer is written past its end:
+	 * have the functions size OUT buffers in whole packets (iOS always
+	 * programs mps * packets).
+	 */
+	if (using_dma(hsotg) && hsotg->params.g_dma_out_whole_packets)
+		hsotg->gadget.quirk_ep_out_aligned_size = true;
+	/*
+	 * Received Ethernet frames straight into word-aligned skbs: the
+	 * core's DMA needs a word-aligned address, and the two bytes u_ether
+	 * otherwise leaves in front cost a bounce buffer and a copy for every
+	 * packet.
+	 */
+	if (using_dma(hsotg) && hsotg->params.g_dma_avoids_skb_reserve)
+		hsotg->gadget.quirk_avoids_skb_reserve = true;
 	hsotg->gadget.otg_caps = &hsotg->params.otg_caps;
 	hsotg->remote_wakeup_allowed = 0;
 
@@ -5181,6 +5251,50 @@ int dwc2_hsotg_resume(struct dwc2_hsotg *hsotg)
 	}
 
 	return 0;
+}
+
+/*
+ * The cable is out (VBUS from an external detector): stop the gadget as a
+ * system suspend does, whatever state the link was left in by the pull,
+ * so that the core's clock can be gated. The link is then disconnected.
+ */
+void dwc2_hsotg_vbus_off(struct dwc2_hsotg *hsotg)
+{
+	unsigned long flags;
+	int ep;
+
+	if (!hsotg->driver)
+		return;
+	spin_lock_irqsave(&hsotg->lock, flags);
+	if (hsotg->enabled)
+		dwc2_hsotg_core_disconnect(hsotg);
+	dwc2_hsotg_disconnect(hsotg);
+	hsotg->gadget.speed = USB_SPEED_UNKNOWN;
+	hsotg->lx_state = DWC2_L3;
+	spin_unlock_irqrestore(&hsotg->lock, flags);
+
+	for (ep = 1; ep < hsotg->num_of_eps; ep++) {
+		if (hsotg->eps_in[ep])
+			dwc2_hsotg_ep_disable_lock(&hsotg->eps_in[ep]->ep);
+		if (hsotg->eps_out[ep])
+			dwc2_hsotg_ep_disable_lock(&hsotg->eps_out[ep]->ep);
+	}
+}
+
+/* The cable is back, the core clocked again: start over as on resume. */
+void dwc2_hsotg_vbus_on(struct dwc2_hsotg *hsotg)
+{
+	unsigned long flags;
+
+	if (!hsotg->driver)
+		return;
+	spin_lock_irqsave(&hsotg->lock, flags);
+	dwc2_hsotg_core_init_disconnected(hsotg, false);
+	if (hsotg->enabled) {
+		dwc2_enable_acg(hsotg);
+		dwc2_hsotg_core_connect(hsotg);
+	}
+	spin_unlock_irqrestore(&hsotg->lock, flags);
 }
 
 /**

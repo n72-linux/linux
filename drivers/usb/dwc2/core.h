@@ -9,6 +9,7 @@
 #define __DWC2_CORE_H__
 
 #include <linux/acpi.h>
+#include <linux/jump_label.h>
 #include <linux/phy/phy.h>
 #include <linux/regulator/consumer.h>
 #include <linux/usb/gadget.h>
@@ -519,6 +520,32 @@ struct dwc2_core_params {
 	 * masked until a session-valid signal arrives.
 	 */
 	bool session_valid_gintmsk_quirk;
+
+	/*
+	 * Move the link back to L0 on a bus reset when it was left in L2 or
+	 * L3 by a cable pull and no partial power down or clock gating is
+	 * there to exit (Apple S5L87xx, see dwc2_hsotg_irq()).
+	 */
+	bool bus_reset_to_l0;
+
+	/*
+	 * Buffer DMA on the Apple S5L8720, done as its boot loader and iOS do
+	 * it:
+	 * g_dma_addr_on_continue: DIEPDMA/DOEPDMA written again when a
+	 *	request continues (EP0 replies longer than a packet), rather
+	 *	than relying on the core having advanced it.
+	 * g_dma_nak_idle_out: an OUT endpoint NAKs while no request is
+	 *	queued on it, see dwc2_hsotg_ep_enable().
+	 * g_dma_out_whole_packets: OUT buffers sized in whole packets
+	 *	(the gadget's quirk_ep_out_aligned_size): a packet longer than
+	 *	the buffer is written past its end.
+	 * g_dma_avoids_skb_reserve: the gadget's quirk_avoids_skb_reserve,
+	 *	for word-aligned receive buffers without a bounce.
+	 */
+	bool g_dma_addr_on_continue;
+	bool g_dma_nak_idle_out;
+	bool g_dma_out_whole_packets;
+	bool g_dma_avoids_skb_reserve;
 };
 
 /**
@@ -1116,6 +1143,32 @@ struct dwc2_hsotg {
 	struct dentry *debug_root;
 	struct debugfs_regset32 *regset;
 	bool needs_byte_swap;
+	/*
+	 * Set while the core's clock is off (lowlevel hw disabled): register
+	 * reads return 0 and writes are dropped. On SoCs where "otg" is a
+	 * clock gate (Apple S5L8720), touching the gated core hangs the bus,
+	 * and paths such as an endpoint queue from the gadget driver can
+	 * still get here while the cable is out. Only kept, and only tested
+	 * (behind dwc2_regs_gate_key), with clk_gate_hangs_bus.
+	 */
+	bool regs_gated;
+	/*
+	 * Known from the compatible before the first register access, so
+	 * before dwc2_init_params() (Apple S5L87xx): a register access with
+	 * the "otg" clock off hangs the bus, and PCGCTL can be found set.
+	 */
+	bool clk_gate_hangs_bus;
+	bool ungate_pcgctl;
+	/*
+	 * VBUS from a power supply ("apple,vbus-psy-name"): without it
+	 * the gadget is stopped and the core's clock gated (vbus_off).
+	 */
+	const char *vbus_psy_name;
+	struct notifier_block vbus_nb;
+	struct work_struct vbus_work;
+	struct mutex vbus_lock;
+	bool vbus_off;
+	bool vbus_frozen;		/* system sleep: no changes until resume */
 
 	/* DWC OTG HW Release versions */
 #define DWC2_CORE_REV_4_30a	0x4f54430a
@@ -1236,11 +1289,22 @@ struct dwc2_hsotg {
 #endif /* CONFIG_USB_DWC2_PERIPHERAL || CONFIG_USB_DWC2_DUAL_ROLE */
 };
 
+/* Enabled while a core with clk_gate_hangs_bus is bound. */
+DECLARE_STATIC_KEY_FALSE(dwc2_regs_gate_key);
+
+static inline bool dwc2_regs_are_gated(struct dwc2_hsotg *hsotg)
+{
+	return static_branch_unlikely(&dwc2_regs_gate_key) &&
+	       READ_ONCE(hsotg->regs_gated);
+}
+
 /* Normal architectures just use readl/write */
 static inline u32 dwc2_readl(struct dwc2_hsotg *hsotg, u32 offset)
 {
 	u32 val;
 
+	if (dwc2_regs_are_gated(hsotg))
+		return 0;
 	val = readl(hsotg->regs + offset);
 	if (hsotg->needs_byte_swap)
 		return swab32(val);
@@ -1250,6 +1314,8 @@ static inline u32 dwc2_readl(struct dwc2_hsotg *hsotg, u32 offset)
 
 static inline void dwc2_writel(struct dwc2_hsotg *hsotg, u32 value, u32 offset)
 {
+	if (dwc2_regs_are_gated(hsotg))
+		return;
 	if (hsotg->needs_byte_swap)
 		writel(swab32(value), hsotg->regs + offset);
 	else
@@ -1424,6 +1490,8 @@ void dwc2_dump_global_registers(struct dwc2_hsotg *hsotg);
 int dwc2_hsotg_remove(struct dwc2_hsotg *hsotg);
 int dwc2_hsotg_suspend(struct dwc2_hsotg *dwc2);
 int dwc2_hsotg_resume(struct dwc2_hsotg *dwc2);
+void dwc2_hsotg_vbus_off(struct dwc2_hsotg *dwc2);
+void dwc2_hsotg_vbus_on(struct dwc2_hsotg *dwc2);
 int dwc2_gadget_init(struct dwc2_hsotg *hsotg);
 void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *dwc2,
 				       bool reset);
@@ -1459,6 +1527,8 @@ static inline int dwc2_hsotg_suspend(struct dwc2_hsotg *dwc2)
 { return 0; }
 static inline int dwc2_hsotg_resume(struct dwc2_hsotg *dwc2)
 { return 0; }
+static inline void dwc2_hsotg_vbus_off(struct dwc2_hsotg *dwc2) {}
+static inline void dwc2_hsotg_vbus_on(struct dwc2_hsotg *dwc2) {}
 static inline int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 { return 0; }
 static inline void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *dwc2,
