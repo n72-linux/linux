@@ -61,8 +61,16 @@
 #define S5L8720_SPI_MAXDIV	0x3ff
 #define S5L8720_SPI_FIFO_DEPTH	16U
 #define S5L8720_SPI_MAX_WORDS	0xffffU
-#define S5L8720_SPI_DMA_BUF_SZ	4096U
-#define S5L8720_SPI_DMA_WORDS	4092U
+#define S5L8720_SPI_DMA_BUF_SZ		65536U
+#define S5L8720_SPI_DMA_LLI_WORDS	3584U	/* 0xe00 32-bit src words/LLI */
+#define S5L8720_SPI_DMA_MAX_LLIS	16U
+
+struct s5l8720_spi_lli {
+	u32 src;
+	u32 dst;
+	u32 next;
+	u32 cctl;
+};
 
 struct s5l8720_spi {
 	void __iomem *base;
@@ -93,6 +101,8 @@ struct s5l8720_spi {
 	u32 dma_req;
 	void *dma_buf;
 	dma_addr_t dma_addr;
+	struct s5l8720_spi_lli *lli;
+	dma_addr_t lli_addr;
 	struct completion dma_done;
 	bool dmac_active;
 	int dma_err;
@@ -411,97 +421,108 @@ static int s5l8720_spi_tx_dma_segment(struct s5l8720_spi *ss,
 {
 	void __iomem *ch = ss->dmac + PL080_Cx_BASE(ss->dma_ch);
 	void __iomem *b = ss->base;
-	unsigned int max_words = min(S5L8720_SPI_DMA_BUF_SZ / bytes,
-				     S5L8720_SPI_DMA_WORDS);
-	u32 width = bytes == 4 ? PL080_WIDTH_32BIT :
-		    bytes == 2 ? PL080_WIDTH_16BIT : PL080_WIDTH_8BIT;
+	unsigned int total_bytes = seg * bytes;
+	unsigned int src_words = total_bytes >> 2;
+	unsigned int i, off, n = DIV_ROUND_UP(src_words, S5L8720_SPI_DMA_LLI_WORDS);
+	u32 dwidth = bytes == 4 ? PL080_WIDTH_32BIT :
+		     bytes == 2 ? PL080_WIDTH_16BIT : PL080_WIDTH_8BIT;
 	u32 cctl_base = (PL080_BSIZE_4 << PL080_CONTROL_SB_SIZE_SHIFT) |
 			(PL080_BSIZE_4 << PL080_CONTROL_DB_SIZE_SHIFT) |
-			(width << PL080_CONTROL_SWIDTH_SHIFT) |
-			(width << PL080_CONTROL_DWIDTH_SHIFT) |
-			PL080_CONTROL_SRC_INCR | PL080_CONTROL_TC_IRQ_EN;
+			(PL080_WIDTH_32BIT << PL080_CONTROL_SWIDTH_SHIFT) |
+			(dwidth << PL080_CONTROL_DWIDTH_SHIFT) |
+			PL080_CONTROL_SRC_INCR;
 	u32 ccfg = (ss->dma_req << PL080_CONFIG_DST_SEL_SHIFT) |
 		   (PL080_FLOW_MEM2PER << PL080_CONFIG_FLOW_CONTROL_SHIFT) |
 		   PL080_CONFIG_TC_IRQ_MASK | PL080_CONFIG_ERR_IRQ_MASK |
 		   PL080_CONFIG_ENABLE;
+	unsigned long timeout_ms = max_t(unsigned long, 250,
+		DIV_ROUND_UP_ULL((u64)timeout_us *
+				 DIV_ROUND_UP(seg, S5L8720_SPI_FIFO_DEPTH),
+				 USEC_PER_MSEC));
+	ktime_t end;
 	int ret;
+
+	if (!n || n > S5L8720_SPI_DMA_MAX_LLIS)
+		return -EINVAL;
+
+	for (i = 0, off = 0; i < n; i++, off += S5L8720_SPI_DMA_LLI_WORDS) {
+		u32 xfer = min_t(u32, S5L8720_SPI_DMA_LLI_WORDS,
+				 src_words - off);
+
+		ss->lli[i].src = lower_32_bits(ss->dma_addr + off * 4);
+		ss->lli[i].dst = lower_32_bits(ss->phys + SPI_TXDATA);
+		ss->lli[i].next = (i + 1 < n) ?
+			lower_32_bits(ss->lli_addr + (i + 1) * sizeof(*ss->lli)) : 0;
+		ss->lli[i].cctl = cctl_base | xfer |
+			(i + 1 == n ? PL080_CONTROL_TC_IRQ_EN : 0);
+	}
+
+	memcpy(ss->dma_buf, tx, total_bytes);
+	/* Order bounce-buffer and LLI descriptor writes before starting PL080 DMA. */
+	dma_wmb();
 
 	ret = clk_enable(ss->dmac_clk);
 	if (ret)
 		return ret;
 
-	while (seg) {
-		unsigned int chunk = min(seg, max_words);
-		unsigned long timeout_ms = max_t(unsigned long, 100,
-			DIV_ROUND_UP_ULL((u64)timeout_us *
-					 DIV_ROUND_UP(chunk, S5L8720_SPI_FIFO_DEPTH),
-					 USEC_PER_MSEC));
-		ktime_t end;
+	writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
+	writel(setup, b + SPI_SETUP);
+	writel(CONTROL_ENABLE | CONTROL_RESET_TX | CONTROL_RESET_RX,
+	       b + SPI_CONTROL);
+	writel(0, b + SPI_RXCNT);
+	writel(seg, b + SPI_TXLEN);
 
-		memcpy(ss->dma_buf, tx, chunk * bytes);
-		/* Order coherent bounce-buffer writes before starting PL080 DMA. */
-		dma_wmb();
+	reinit_completion(&ss->dma_done);
+	ss->dma_err = 0;
+	WRITE_ONCE(ss->dmac_active, true);
 
-		writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
-		writel(setup, b + SPI_SETUP);
-		writel(CONTROL_ENABLE | CONTROL_RESET_TX | CONTROL_RESET_RX,
-		       b + SPI_CONTROL);
-		writel(0, b + SPI_RXCNT);
-		writel(chunk, b + SPI_TXLEN);
+	writel(PL080_CONFIG_ENABLE, ss->dmac + PL080_CONFIG);
+	writel(BIT(ss->dma_ch), ss->dmac + PL080_TC_CLEAR);
+	writel(BIT(ss->dma_ch), ss->dmac + PL080_ERR_CLEAR);
+	writel(ss->lli[0].src, ch + PL080_CH_SRC_ADDR);
+	writel(ss->lli[0].dst, ch + PL080_CH_DST_ADDR);
+	writel(ss->lli[0].next, ch + PL080_CH_LLI);
+	writel(ss->lli[0].cctl, ch + PL080_CH_CONTROL);
+	writel(ccfg, ch + PL080_CH_CONFIG);
 
-		reinit_completion(&ss->dma_done);
-		ss->dma_err = 0;
-		WRITE_ONCE(ss->dmac_active, true);
+	writel(setup | SETUP_TX_DMA, b + SPI_SETUP);
 
-		writel(PL080_CONFIG_ENABLE, ss->dmac + PL080_CONFIG);
-		writel(BIT(ss->dma_ch), ss->dmac + PL080_TC_CLEAR);
-		writel(BIT(ss->dma_ch), ss->dmac + PL080_ERR_CLEAR);
-		writel(lower_32_bits(ss->dma_addr), ch + PL080_CH_SRC_ADDR);
-		writel(lower_32_bits(ss->phys + SPI_TXDATA), ch + PL080_CH_DST_ADDR);
-		writel(0, ch + PL080_CH_LLI);
-		writel(cctl_base | chunk, ch + PL080_CH_CONTROL);
-		writel(ccfg, ch + PL080_CH_CONFIG);
-
-		writel(setup | SETUP_TX_DMA, b + SPI_SETUP);
-
-		if (!wait_for_completion_timeout(&ss->dma_done,
-						 msecs_to_jiffies(timeout_ms))) {
-			WRITE_ONCE(ss->dmac_active, false);
-			writel(0, ch + PL080_CH_CONFIG);
-			writel(setup, b + SPI_SETUP);
-			writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
-			synchronize_irq(ss->dmac_irq);
-			dev_err(&spi->dev, "SPI TX DMA timed out (%u words)\n", chunk);
-			ret = -ETIMEDOUT;
-			break;
-		}
-		if (ss->dma_err) {
-			writel(setup, b + SPI_SETUP);
-			writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
-			ret = ss->dma_err;
-			break;
-		}
-
-		/* Drain the remaining TX FIFO words before deasserting CS. */
-		end = ktime_add_us(ktime_get(), timeout_us);
-		while (FIELD_GET(STATUS_TXLVL, readl(b + SPI_STATUS))) {
-			if (ktime_after(ktime_get(), end)) {
-				writel(setup, b + SPI_SETUP);
-				writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
-				clk_disable(ss->dmac_clk);
-				return -ETIMEDOUT;
-			}
-			cpu_relax();
-		}
-		if (word_us)
-			udelay(word_us);
-
+	if (!wait_for_completion_timeout(&ss->dma_done,
+					 msecs_to_jiffies(timeout_ms))) {
+		WRITE_ONCE(ss->dmac_active, false);
+		writel(0, ch + PL080_CH_CONFIG);
 		writel(setup, b + SPI_SETUP);
 		writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
-		tx += chunk * bytes;
-		seg -= chunk;
+		synchronize_irq(ss->dmac_irq);
+		dev_err(&spi->dev, "SPI TX DMA timed out (%u words)\n", seg);
+		ret = -ETIMEDOUT;
+		goto out_disable;
+	}
+	if (ss->dma_err) {
+		writel(setup, b + SPI_SETUP);
+		writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
+		ret = ss->dma_err;
+		goto out_disable;
 	}
 
+	/* Drain the remaining TX FIFO words before deasserting CS. */
+	end = ktime_add_us(ktime_get(), timeout_us);
+	while (FIELD_GET(STATUS_TXLVL, readl(b + SPI_STATUS))) {
+		if (ktime_after(ktime_get(), end)) {
+			writel(setup, b + SPI_SETUP);
+			writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
+			ret = -ETIMEDOUT;
+			goto out_disable;
+		}
+		cpu_relax();
+	}
+	if (word_us)
+		udelay(word_us * 2);
+
+	writel(setup, b + SPI_SETUP);
+	writel(STATUS_CLEAR_MASK, b + SPI_STATUS);
+
+out_disable:
 	clk_disable(ss->dmac_clk);
 	return ret;
 }
@@ -548,7 +569,9 @@ static int s5l8720_spi_transfer_one(struct spi_controller *ctlr,
 	while (words) {
 		unsigned int seg = min(words, S5L8720_SPI_MAX_WORDS);
 
-		if (ss->dmac && tx && !rx && seg > S5L8720_SPI_FIFO_DEPTH)
+		if (ss->dmac && tx && !rx && seg > S5L8720_SPI_FIFO_DEPTH &&
+		    seg * bytes <= S5L8720_SPI_DMA_BUF_SZ &&
+		    ((seg * bytes) & 3) == 0)
 			ret = s5l8720_spi_tx_dma_segment(ss, spi, setup, tx,
 							 bytes, seg, timeout_us,
 							 word_us);
@@ -633,7 +656,9 @@ static void s5l8720_spi_setup_dma(struct platform_device *pdev,
 	}
 	ss->dma_buf = dmam_alloc_coherent(dev, S5L8720_SPI_DMA_BUF_SZ,
 					  &ss->dma_addr, GFP_KERNEL);
-	if (!ss->dma_buf) {
+	ss->lli = dmam_alloc_coherent(dev, S5L8720_SPI_DMA_MAX_LLIS * sizeof(*ss->lli),
+				      &ss->lli_addr, GFP_KERNEL);
+	if (!ss->dma_buf || !ss->lli) {
 		ss->dmac = NULL;
 		return;
 	}
