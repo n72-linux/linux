@@ -1,0 +1,942 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Apple S5L8720 SoC
+ * Board name: N72AP
+ * Product name: iPod touch (2nd generation)
+ *
+ * Addresses and interrupts for the S5L8720 SoC and N72AP board.
+ * The display is brought up by U-Boot and handed over as a simple
+ * framebuffer.
+ */
+/dts-v1/;
+
+/* First DRAM page: LLB's wake stub, magic and sleep token (pm-n72.c). */
+/memreserve/ 0x08000000 0x00001000;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "Apple iPod touch (2nd generation)";
+	compatible = "apple,n72", "samsung,s5l8720";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		stdout-path = "serial0";
+
+		/* Set up by U-Boot's N72 display driver. */
+		framebuffer0: framebuffer@fc00000 {
+			compatible = "simple-framebuffer";
+			reg = <0x0fc00000 0x96000>;
+			width = <320>;
+			height = <480>;
+			stride = <1280>;
+			format = "x8r8g8b8";
+			status = "okay";
+		};
+	};
+
+	nclk: external_clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "nclk";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			compatible = "arm,arm1176jzf-s";
+		};
+	};
+
+	/*
+	 * KMS (n72-clcd): scans out window 0 of the CLCD; takes over from
+	 * simplefb on the boot framebuffer.
+	 */
+	display-subsystem {
+		compatible = "apple,n72-display";
+		apple,clcd = <&clcd>;
+		apple,framebuffer = <&framebuffer0>;
+		/* the CLCD frame interrupt (iOS clcd "interrupts" 0x0d) */
+		interrupt-parent = <&vic0>;
+		interrupts = <13>;
+	};
+
+	/*
+	 * The low core voltage state (n72-corev): 1.05 V on DOWN0 with the
+	 * system clock at /2 while the display and USB power are off.
+	 */
+	core-voltage {
+		compatible = "apple,n72-core-voltage";
+		core-supply = <&down0>;
+	};
+
+	/* 128 MiB of SDRAM. */
+	memory@8000000 {
+		device_type = "memory";
+		reg = <0x08000000 0x08000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* U-Boot / simple-framebuffer / apple-mbx boot framebuffer (320x480x4). */
+		framebuffer@fc00000 {
+			reg = <0x0fc00000 0x96000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * Open-circuit voltage curve of the N72 cell: iOS's battery-data
+	 * "0003-default" (battery-family 3), in uV and percent.
+	 */
+	battery: battery {
+		compatible = "simple-battery";
+		device-chemistry = "lithium-ion";
+		voltage-min-design-microvolt = <3000000>;
+		voltage-max-design-microvolt = <4200000>;
+		ocv-capacity-celsius = <20>;
+		ocv-capacity-table-0 = <4200000 100>, <4150000 95>, <4129000 91>,
+			<4094000 86>, <4047000 82>, <4023000 77>, <3994000 73>,
+			<3965000 68>, <3941000 64>, <3912000 59>, <3888000 55>,
+			<3877000 50>, <3853000 45>, <3841000 41>, <3824000 36>,
+			<3824000 32>, <3800000 27>, <3800000 23>, <3783000 18>,
+			<3765000 14>, <3742000 9>, <3707000 5>, <3667000 3>,
+			<3450000 2>, <3000000 0>;
+	};
+
+	/*
+	 * BCM4325 (Wi-Fi and Bluetooth) power, shared by the SDIO card and the
+	 * Bluetooth UART device. iOS's function-power_enable is GPIO 6 of the
+	 * *PMU* (its phandle is pmu@73, like hp_detect = PMU GPIO 2 and Mikey's
+	 * interrupt_status = PMU GPIO 7), which the boot chain leaves on; the
+	 * PMU driver has no GPIOs yet, so this is a fixed, always-on supply.
+	 * It must not take the SoC's GPIO 6: that pad (function 2) is the
+	 * free-running 6 MHz codec master clock, and making it a GPIO output
+	 * removes the CS42L58's MCLK (no sound, no clocks from the codec).
+	 */
+	wlbt_power: regulator-wlbt {
+		compatible = "regulator-fixed";
+		regulator-name = "bcm4325";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	wifi_pwrseq: wifi-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		/* Wi-Fi reset, GPIO 117, active-low per the iOS flags */
+		reset-gpios = <&gpio 117 GPIO_ACTIVE_LOW>;
+		/*
+		 * Time between the reset release and the first SDIO command: 10 ms
+		 * is too short (the card did not answer). Bringing Wi-Fi up while
+		 * Bluetooth starts on UART1 is fine now that UART1 has hardware
+		 * flow control (without it Bluetooth lost bytes then).
+		 */
+		post-power-on-delay-ms = <50>;
+	};
+
+	/*
+	 * Audio: S5L8720 I2S0 <-> CS42L58. The codec is the clock provider, as
+	 * under iOS (audio-data TXCON bit 20): it makes the bit and frame clocks
+	 * from its 6 MHz MCLK, which the SoC puts out on pad GPIO 6 (function 2,
+	 * free-running, set up by the boot chain: nothing may claim that GPIO).
+	 * The codec's HP outputs are the headphone jack and also feed the
+	 * LM48821 and the built-in speaker (iOS "hpout-spkr"); its line outputs
+	 * go to the dock connector. The speaker amplifier stays off until
+	 * "Speaker Amp Switch" is turned on. Headphone detect is GPIO 2 of the
+	 * PMU (iOS function-hp_detect, provider pmu@73): the card's jack reports
+	 * SW_HEADPHONE_INSERT and switches the "Headphones" pin; the speaker
+	 * amplifier is switched by user space (n72-ui: on while unplugged).
+	 */
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "N72-CS42L58";
+		simple-audio-card,format = "i2s";
+		/*
+		 * As under iOS, the codec provides the bit and frame clocks
+		 * from its 6 MHz MCLK (SoC pad GPIO 6, function 2); the I2S
+		 * block's clock pads (GPIO 7 and 20, function 3) are inputs.
+		 */
+		simple-audio-card,bitclock-master = <&codec_dai>;
+		simple-audio-card,frame-master = <&codec_dai>;
+		simple-audio-card,widgets =
+			"Headphone", "Headphones",
+			"Speaker", "Speaker",
+			"Line", "Line Out",
+			"Microphone", "Headset Mic";
+		simple-audio-card,routing =
+			"Headphones", "HPOUTA",
+			"Headphones", "HPOUTB",
+			"IN", "SPKOUT",
+			"Speaker", "OUT",
+			"Line Out", "LINEOUTA",
+			"Line Out", "LINEOUTB",
+			/* the headset microphone (iOS ain2a-extmic): the only input */
+			"AIN2A", "Headset Mic";
+		simple-audio-card,aux-devs = <&spkamp>;
+		/* PMU GPIO 2 (iOS function-hp_detect): "Headphones" follows the jack */
+		simple-audio-card,hp-det-gpios = <&pmu 2 GPIO_ACTIVE_HIGH>;
+
+		cpu_dai: simple-audio-card,cpu {
+			sound-dai = <&i2s0>;
+		};
+
+		codec_dai: simple-audio-card,codec {
+			sound-dai = <&codec>;
+		};
+	};
+
+	/* GPIO button pins are numbered as (bank * 8 + pin). */
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		key-home {
+			label = "Home";
+			debounce-interval = <15>;
+			gpios = <&gpio 97 GPIO_ACTIVE_HIGH>;
+			linux,code = <KEY_HOMEPAGE>;
+			wakeup-source;
+		};
+
+		/* Top Sleep/Wake button ("Hold"). */
+		key-power {
+			label = "Power";
+			debounce-interval = <15>;
+			gpios = <&gpio 98 GPIO_ACTIVE_HIGH>;
+			linux,code = <KEY_POWER>;
+			wakeup-source;
+		};
+
+		/*
+		 * Unlike Home and Power, the volume keys read low when pressed, and
+		 * their contacts bounce, so they get a longer debounce.
+		 */
+		key-volume-up {
+			label = "Volume Up";
+			debounce-interval = <50>;
+			gpios = <&gpio 74 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+		};
+
+		key-volume-down {
+			label = "Volume Down";
+			debounce-interval = <50>;
+			gpios = <&gpio 96 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEDOWN>;
+		};
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		vic0: interrupt-controller@38e00000 {
+			compatible = "arm,pl192-vic";
+			interrupt-controller;
+			reg = <0x38e00000 0x1000>;
+			#interrupt-cells = <1>;
+		};
+
+		vic1: interrupt-controller@38e01000 {
+			compatible = "arm,pl192-vic";
+			interrupt-controller;
+			reg = <0x38e01000 0x1000>;
+			#interrupt-cells = <1>;
+		};
+
+		timer: timer@3c700000 {
+			compatible = "samsung,s5l8720-timer";
+			reg = <0x3c700000 0x20000>;
+			/* TIMER64 clock rate on N72 */
+			clock-frequency = <12000000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <7>;
+		};
+
+		/* Dock connector UART; the interrupt number is unverified on N72. */
+		/* Clock gates, <register-index bit> (clk-s5l8720-gate.c) */
+		clkgate: clock-gates@3c500000 {
+			compatible = "apple,s5l8720-clock-gates";
+			reg = <0x3c500000 0x100>;
+			clocks = <&nclk>;
+			#clock-cells = <2>;
+			/*
+			 * Blocks the boot loader leaves clocked that no Linux driver
+			 * uses; iOS keeps every one of them gated, even while it plays
+			 * sound (iOS clkrstgen device-clocks names; <register-index
+			 * bit>, registers 0x48 0x4c 0x58 0x68 0x6c). The system timer
+			 * (channel E and the 64-bit counter) is not among the timers.
+			 */
+			apple,gates-off =
+				<0 3>, <0 4>, <1 17>,	/* AMCSS, the audio/media coprocessor */
+				<0 12>,			/* DMAC1 */
+				<1 2>, <4 13>,		/* SPI0 */
+				<1 15>, <4 15>,		/* SPI2 */
+				<2 1>, <4 19>,		/* SPI3 */
+				<1 30>, <4 9>,		/* UART2 */
+				<1 31>, <4 10>,		/* UART3 */
+				<1 14>,			/* ECID */
+				<1 5>, <4 0>,		/* TIMERA */
+				<1 23>, <4 1>,		/* TIMERB */
+				<2 5>, <4 22>,		/* TIMERC */
+				<2 6>, <4 23>,		/* TIMERD */
+				<1 25>, <4 3>,		/* TIMERF */
+				<1 26>, <4 4>,		/* TIMERG */
+				<1 27>, <4 5>;		/* TIMERH */
+		};
+
+		uart0: serial@3cc00000 {
+			compatible = "apple,s5l-uart";
+			reg = <0x3cc00000 0x3c>;
+			clocks = <&nclk>, <&nclk>;
+			clock-names = "uart", "clk_uart_baud0";
+			reg-io-width = <4>;
+			interrupt-parent = <&vic0>;
+			interrupts = <24>;
+			status = "okay";
+		};
+
+		/*
+		 * UART1: the BCM4325's Bluetooth (iOS uart1@5B00000, interrupt
+		 * 0x19, device-clocks id 0x30: 0x4c bit 29 and 0x6c bit 8). TX is
+		 * GPIO 79 (function 2 from the boot loader) and RTS GPIO 80, put in
+		 * its UART function by the GPIO node: with the UART's auto flow
+		 * control the chip is held off when the RX FIFO fills.
+		 */
+		uart1: serial@3db00000 {
+			compatible = "apple,s5l8720-uart", "apple,s5l-uart";
+			reg = <0x3db00000 0x3c>;
+			clocks = <&clkgate 1 29>, <&clkgate 4 8>;
+			clock-names = "uart", "clk_uart_baud0";
+			reg-io-width = <4>;
+			interrupt-parent = <&vic0>;
+			interrupts = <25>;
+			/*
+			 * Sending goes through DMAC0 as under iOS (uart1
+			 * dma-channels: request 8 to UTXH, 8-bit, one byte per
+			 * request, the PL080 counting; iOS's control word selects
+			 * AHB master 1 for this port, unlike I2S). Request 9 is
+			 * the receive side: the PL080 fills a ring and the
+			 * port's receive timeout marks the end of a packet.
+			 * With the 16-byte FIFO alone, Bluetooth audio cost
+			 * about 2750 interrupts a second; with both, about 83.
+			 */
+			dmas = <&dmac0 8 1>, <&dmac0 9 1>;
+			dma-names = "tx", "rx";
+			status = "okay";
+
+			/*
+			 * iOS: bt_reset GPIO 84 (low = held in reset), bt_wake GPIO 83,
+			 * 3 Mbaud. GPIO 84 is given to the driver as its "shutdown"
+			 * line (high = running): with one, hci_bcm may move the UART
+			 * off 115200, since it can always reset the chip back to it. Host
+			 * wake comes through the PMU ("ldo2_en" event "bt").
+			 */
+			bluetooth {
+				compatible = "brcm,bcm4329-bt";
+				shutdown-gpios = <&gpio 84 GPIO_ACTIVE_HIGH>;
+				/*
+				 * bt_wake, as in iOS's device tree: high keeps the chip
+				 * awake. hci_bcm lets it go while the port is idle.
+				 */
+				device-wakeup-gpios = <&gpio 83 GPIO_ACTIVE_HIGH>;
+				/*
+				 * The chip's host wake line goes to the PMU, not to a
+				 * GPIO (INT2 bit 0, iOS's wake event "bt"): the PMU's
+				 * line 9. With both lines hci_bcm sets the chip's sleep
+				 * mode and the UART runtime-suspends between packets.
+				 */
+				interrupts-extended = <&pmu 9 IRQ_TYPE_EDGE_RISING>;
+				interrupt-names = "host-wakeup";
+				vbat-supply = <&wlbt_power>;
+				/*
+				 * 3 Mbaud as under iOS (transport-speed): 8 samples per
+				 * bit of the 24 MHz UART clock, with hardware flow
+				 * control (RTS on GPIO 80; the UART's auto flow control).
+				 */
+				max-speed = <3000000>;
+			};
+		};
+
+		usbphy: usbphy@3c400000 {
+			compatible = "apple,s5l8720-otgphy";
+			reg = <0x3c400000 0x100>;
+			#phy-cells = <0>;
+			status = "okay";
+		};
+
+		/*
+		 * DMAC0, an ARM PL080 (interrupt 0x10, device clock gate id 0x0d:
+		 * 0x3c500048 bit 11). AHB master 2 is used for both memory and
+		 * peripherals. The ID registers are not relied on. Requests:
+		 * 10 = I2S0 TX, 11 = I2S0 RX.
+		 */
+		dmac0: dma-controller@38200000 {
+			compatible = "arm,pl080", "arm,primecell";
+			arm,primecell-periphid = <0x00041080>;
+			reg = <0x38200000 0x1000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <16>;
+			clocks = <&clkgate 0 11>;
+			clock-names = "apb_pclk";
+			lli-bus-interface-ahb2;
+			mem-bus-interface-ahb2;
+			#dma-cells = <2>;
+		};
+
+		/*
+		 * DMAC1, a second PL080 (iOS dmac1@700000, interrupt 0x11,
+		 * clock gate 0x3c500048 bit 12). iOS feeds the GPU's tile
+		 * accelerator (and SPI4) through it. The GPU driver programs it
+		 * directly ("apple,feed-dma" in the gpu node): its channel needs
+		 * memory-to-memory flow control with a fixed destination, which
+		 * the PL080 dmaengine driver cannot be asked for, and nothing
+		 * else here uses this controller, so it is reserved rather than
+		 * bound. iOS's "DMACM" (0x68 bit 8) is not needed for it (the
+		 * feed runs with that gate closed).
+		 */
+		dmac1: dma-controller@38700000 {
+			compatible = "arm,pl080", "arm,primecell";
+			arm,primecell-periphid = <0x00041080>;
+			reg = <0x38700000 0x1000>;
+			clocks = <&clkgate 0 12>;
+			clock-names = "apb_pclk";
+			#dma-cells = <2>;
+			status = "reserved";
+		};
+
+		/*
+		 * I2S0 (iOS i2s0@4A00000, interrupt 0x2c, device-clocks id 0x14:
+		 * gate 0x3c50004c bit 7). TX FIFO at +0x10, RX FIFO at +0x38,
+		 * 16-bit beats in bursts of 4 (iOS dma-channels). The codec's
+		 * 6 MHz MCLK is believed to be this block's clock output, so its
+		 * gate stays open from probe on.
+		 */
+		i2s0: i2s@3ca00000 {
+			compatible = "apple,s5l8720-i2s";
+			reg = <0x3ca00000 0x1000>;
+			interrupt-parent = <&vic1>;
+			interrupts = <12>;
+			/*
+			 * I2S0 (0x4c bit 7) and iOS's "DMACM" (0x68 bit 8), whose
+			 * role is unknown. (DMAC0, 0x48 bit 11, is the PL080's
+			 * apb_pclk.)
+			 */
+			clocks = <&clkgate 1 7>, <&clkgate 3 8>;
+			clock-names = "i2s", "dmacm";
+			dmas = <&dmac0 10 2>, <&dmac0 11 2>;
+			dma-names = "tx", "rx";
+			#sound-dai-cells = <0>;
+		};
+
+		/*
+		 * PowerVR MBX Lite: core, Apple wrapper, and its clock gate
+		 * (iOS device-clocks id 0x18: 0x3c500068 bits 5-7, cleared
+		 * together); interrupt 0x35.
+		 */
+		gpu@3b000000 {
+			compatible = "apple,s5l8720-mbx";
+			reg = <0x3b000000 0x1000000>, <0x39400000 0x1000>;
+			reg-names = "core", "wrapper";
+			clocks = <&clkgate 3 5>;
+			/*
+			 * The tile accelerator takes its command stream by DMA
+			 * (iOS mbx dma-parent dmac1, dma-channels <0x40
+			 * 0x00489000 0 0x3b800000 5>): channel 5 of DMAC1,
+			 * memory-to-memory flow control into core + 0x800000.
+			 */
+			apple,feed-dma = <&dmac1 5>;
+			apple,framebuffer = <&framebuffer0>;
+			interrupt-parent = <&vic1>;
+			interrupts = <21>;
+		};
+
+		/*
+		 * SDIO host for the BCM4325 Wi-Fi chip (iOS "sdio,s5l8900x",
+		 * interrupt 0x2a, clock gate 0x3c500048 bit 8). The power enable
+		 * (PMU GPIO 6, left on by the boot chain; wlbt_power, shared with Bluetooth)
+		 * and reset (GPIO 117, active-low per the iOS flags, wifi_pwrseq).
+		 * Brings up wlan0 (BCM4325, firmware 4.217.87.17).
+		 */
+		/*
+		 * NAND controller (iOS fmss@A00000, "fmss,s5l8720x"): 2 CEs, read
+		 * ID 98 d7 94 32 76 54 0c (Toshiba). Clock gates from iOS's
+		 * device-clocks entry 0x10 "FMSS": 0x48 bits 5 and 9.
+		 */
+		fmss: flash-controller@38a00000 {
+			compatible = "apple,s5l8720-fmss";
+			reg = <0x38a00000 0x1000>;
+			interrupt-parent = <&vic1>;
+			interrupts = <22>;
+			/* FMSS, gated between operations (iOS device-clocks id 0x10) */
+			clocks = <&clkgate 0 5>, <&clkgate 0 9>;
+			apple,ce-bitmap = <3>;
+			apple,read-setup-clks = <1>;
+			apple,read-hold-clks = <1>;
+			apple,read-dccycle-clks = <2>;
+			apple,page-size = <8192>;
+			apple,expected-readid = <0x3294d798>;
+		};
+
+		/*
+		 * Scaler and colour space converter (iOS scaler@1000000,
+		 * interrupt 0x25, device-clocks id 0x1e: 0x68 bit 4).
+		 */
+		scaler: scaler@39000000 {
+			compatible = "apple,s5l8720-scaler";
+			reg = <0x39000000 0x1000>;
+			interrupt-parent = <&vic1>;
+			interrupts = <5>;
+			clocks = <&clkgate 3 4>;
+		};
+
+		/*
+		 * H.264 decoder (iOS h264decoder@F00000, interrupt 0x23,
+		 * device-clocks id 0x11: 0x68 bit 2 and 0x6c bit 18 under the
+		 * parent PL-MPVD, id 2, 0x4c bit 21). The second region is
+		 * the reset block's register iOS's driver calls the AXI bus
+		 * and sets to 1 when it opens.
+		 */
+		h264: video-codec@38f00000 {
+			compatible = "apple,s5l8720-h264";
+			reg = <0x38f00000 0x4000>, <0x3e000000 0x10>;
+			interrupt-parent = <&vic1>;
+			interrupts = <3>;
+			clocks = <&clkgate 1 21>, <&clkgate 3 2>, <&clkgate 4 18>;
+		};
+
+		/*
+		 * MPEG-4 Part 2 and H.263 decoder (iOS mpvd@1600000, interrupt
+		 * 0x2d, device-clocks id 0x1a: 0x68 bit 3 under PL-MPVD). Its
+		 * units DDM, MP4DE, VLD, IQ, IMC and MI, then the reset block,
+		 * whose 0x04 gives this block or the H.264 one the memory path.
+		 */
+		mpvd: video-codec@39600000 {
+			compatible = "apple,s5l8720-mpvd";
+			reg = <0x39600000 0x1000>, <0x39610000 0x1000>,
+			      <0x39630000 0x1000>, <0x39641000 0x1000>,
+			      <0x39650000 0x1000>, <0x39660000 0x1000>,
+			      <0x3e000000 0x10>;
+			interrupt-parent = <&vic1>;
+			interrupts = <13>;
+			clocks = <&clkgate 1 21>, <&clkgate 3 3>;
+		};
+
+		/*
+		 * AMC audio coprocessor: the Data Engine and its 192 KiB SRAM,
+		 * interrupt 0x12, clock-gate id 9 (0x48 bits 3-4, 0x4c bit 17).
+		 * Hardware MP3/AAC/HE-AAC/ALAC decoding; firmware at apple/amc-*.bin.
+		 */
+		amc: audio-codec@38500000 {
+			compatible = "apple,s5l8720-amc";
+			reg = <0x38500000 0x2000>, <0x22000000 0x30000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <18>;
+			clocks = <&clkgate 0 3>, <&clkgate 0 4>, <&clkgate 1 17>;
+			apple,bus-frequency = <133000000>;
+		};
+
+		sdio: mmc@38d00000 {
+			compatible = "apple,s5l8720-sdio", "apple,s5l8900-sdio";
+			reg = <0x38d00000 0x1000>;
+			/* SDIO (iOS device-clocks id 0x1f), gated across system sleep */
+			clocks = <&clkgate 0 8>;
+			clock-frequency = <51200000>;
+			interrupt-parent = <&vic1>;
+			interrupts = <10>;
+			bus-width = <4>;
+			max-frequency = <25600000>;
+			non-removable;
+			cap-sdio-irq;
+			keep-power-in-suspend;
+			mmc-pwrseq = <&wifi_pwrseq>;
+			vmmc-supply = <&wlbt_power>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			wifi@1 {
+				reg = <1>;
+				compatible = "brcm,bcm4329-fmac";
+				/* Hardware default drive strength: 12 mA */
+				brcm,drive-strength = <12>;
+				/*
+				 * The chip's host wake line (its GPIO 0) ends at
+				 * the PMU's "on" input, iOS's wake event "wlan":
+				 * through I2C, so only for a sleeping bus.
+				 */
+				interrupts-extended = <&pmu 8 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names = "host-wake";
+				apple,host-wake-only;
+			};
+		};
+
+		usbotg_hs: usb@38400000 {
+			compatible = "apple,s5l8720-usb", "apple,s5l87xx-usb";
+			reg = <0x38400000 0x40000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <19>;
+			phys = <&usbphy>;
+			phy-names = "usb2-phy";
+			/*
+			 * The USB OTG gate (iOS device-clocks: 0x3c500048 bit 2).
+			 * dwc2 closes it with the gadget stopped: in system sleep,
+			 * and while the PMU reports no USB power (cable out).
+			 */
+			clocks = <&clkgate 0 2>;
+			clock-names = "otg";
+			apple,vbus-psy-name = "usb";
+			/*
+			 * The core reports 2080 words of FIFO RAM, but on N72 an IN
+			 * FIFO starting at word 0x2a0 only ever shows 0x20 words
+			 * free: usable FIFO RAM ends at word 0x2c0 (704). Keep every
+			 * FIFO below that: RX 280, NP-TX 32, one 128-word FIFO for
+			 * high-speed bulk IN and small FIFOs for the rest (552).
+			 */
+			g-rx-fifo-size = <280>;
+			g-np-tx-fifo-size = <32>;
+			g-tx-fifo-size = <128 16 16 16 16 16 16 16>;
+			dr_mode = "peripheral";
+			status = "okay";
+		};
+
+		/*
+		 * GPIO banks and, as a second range, the GPIO interrupt
+		 * controller. Five interrupt groups of 32 (iOS device tree:
+		 * VIC 0x21, 0x20, 0x1f, 0x03, 0x02); interrupt = pin + 24.
+		 */
+		gpio: gpio-controller@3cf00000 {
+			compatible = "apple,s5l8720-gpio";
+			reg = <0x3cf00000 0x200>, <0x39700000 0x1000>;
+			/*
+			 * Pads that must be in a peripheral function:
+			 * I2S0, as the boot chain and iOS have them: GPIO 6 = the
+			 * codec's 6 MHz MCLK output (function 2), GPIO 7 and 20 =
+			 * bit/frame clock inputs from the codec (function 3), GPIO 21
+			 * = data out (function 2).
+			 * GPIO 80 = UART1's RTS to the BCM4325 (iOS uart1
+			 * function-rts, function 2; the boot chain leaves it a GPIO
+			 * output, so the chip could never be throttled).
+			 */
+			apple,pin-functions = <6 2>, <7 3>, <20 3>, <21 2>, <80 2>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&vic1 1>, <&vic1 0>, <&vic0 31>,
+					      <&vic0 3>, <&vic0 2>;
+
+		};
+
+		/*
+		 * I2C0's interrupt is VIC0 21 (iOS 0x15), in interrupt mode like
+		 * I2C1. Atomic transfers (power-off, the suspend-to-RAM path with
+		 * interrupts off) still poll.
+		 */
+		i2c0: i2c@3c600000 {
+			compatible = "apple,s5l8720-i2c", "samsung,s5l8702-i2c";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <0x3c600000 0x100>;
+			interrupt-parent = <&vic0>;
+			interrupts = <21>;
+			clock-frequency = <100000>;
+			/* I2C0, gated between transfers (hardware clock gate id 0x12) */
+			clocks = <&clkgate 1 4>, <&clkgate 4 11>;
+			status = "okay";
+
+			pmu: pmic@73 {
+				compatible = "apple,n72-pmu";
+				reg = <0x73>;
+				/* iOS: interrupt 0x61 on the GPIO controller, low while pending */
+				interrupts-extended = <&gpio 0x61 IRQ_TYPE_LEVEL_LOW>;
+				system-power-controller;
+				monitored-battery = <&battery>;
+				/*
+				 * The PMU's GPIOs (iOS "GPIO" functions on pmu@73):
+				 * 2 = headphone detect, high while plugged.
+				 */
+				gpio-controller;
+				#gpio-cells = <2>;
+				interrupt-controller;
+				#interrupt-cells = <2>;
+
+				/* Only regulators described here can be switched or set. */
+				regulators {
+					/*
+					 * SoC core rail. The constraints span the converter's
+					 * whole range, so the regulator core never moves it on
+					 * its own; the core voltage policy sets 1.05 or 1.20 V.
+					 */
+					down0: down0 {
+						regulator-name = "core";
+						regulator-min-microvolt = <725000>;
+						regulator-max-microvolt = <1500000>;
+						regulator-always-on;
+						regulator-boot-on;
+					};
+
+					/* touch controller (iOS power_ldo) */
+					ldo3: ldo3 {
+						regulator-name = "touch";
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <1800000>;
+						regulator-always-on;
+					};
+
+					/* panel (iOS lcd_ldo); n72-lcd switches it */
+					ldo4: ldo4 {
+						regulator-name = "lcd";
+						regulator-min-microvolt = <3000000>;
+						regulator-max-microvolt = <3000000>;
+						regulator-boot-on;
+					};
+				};
+			};
+
+			/*
+			 * LIS331DL (LIS302DL-compatible) accelerometer; GPIO
+			 * controller interrupt 0x63, orientation flags = 4
+			 * (8=swap X/Y, 1=negate X, 2=negate Y, 4=negate Z), so on
+			 * N72 only Z is inverted. Its INT1 and INT2 are tied
+			 * together (either alone driving it reads low, both high):
+			 * both carry the free-fall/wake-up units, the "motion"
+			 * wake that reports orientation changes without polling.
+			 */
+			accelerometer@1d {
+				compatible = "st,lis3lv02d";
+				reg = <0x1d>;
+				interrupts-extended = <&gpio 0x63 IRQ_TYPE_EDGE_RISING>;
+				st,irq1-ff-wu-1;
+				st,irq1-ff-wu-2;
+				st,irq2-ff-wu-1;
+				st,irq2-ff-wu-2;
+				st,axis-x = <1>;
+				st,axis-y = <2>;
+				st,axis-z = <(-3)>;
+			};
+
+			/*
+			 * CS42L58 codec (iOS audio0@4A): reset GPIO 72, active-low
+			 * per the iOS flags (01 00 01 00); 6 MHz MCLK; interrupt
+			 * through the PMU (not used).
+			 */
+			codec: audio-codec@4a {
+				compatible = "cirrus,cs42l58";
+				reg = <0x4a>;
+				reset-gpios = <&gpio 72 GPIO_ACTIVE_LOW>;
+				#sound-dai-cells = <0>;
+			};
+
+			/* LM48821 speaker amplifier (iOS spkr-amp@76), enable GPIO 114 */
+			spkamp: amplifier@76 {
+				compatible = "ti,lm48821";
+				reg = <0x76>;
+				/* low = on: iOS drives it low while playing; heard on the device */
+				enable-gpios = <&gpio 114 GPIO_ACTIVE_LOW>;
+			};
+		};
+
+		/*
+		 * I2C1 (iOS i2c1@4900000, interrupt 0x16): ambient light sensor.
+		 * iOS device-clocks id 0x13: gates 0x4c bit 6 and 0x6c bit 12.
+		 * Pins 0x102/0x103 (SCL/SDA) are expected in their I2C function
+		 * from the boot loader. Interrupt: VIC0 22 (iOS 0x16), the first
+		 * bus to run the driver in interrupt mode on N72.
+		 */
+		i2c1: i2c@3c900000 {
+			compatible = "apple,s5l8720-i2c", "samsung,s5l8702-i2c";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <0x3c900000 0x100>;
+			interrupt-parent = <&vic0>;
+			interrupts = <22>;
+			clock-frequency = <100000>;
+			/* I2C1, gated between transfers (hardware clock gate id 0x13) */
+			clocks = <&clkgate 1 6>, <&clkgate 4 12>;
+			status = "okay";
+
+			/*
+			 * CD3272 "Mikey" headset remote and microphone switch
+			 * (iOS mikey@39). Its interrupt and the headphone jack
+			 * arrive as one PMU interrupt (line 2, shared with the
+			 * sound card's jack): no polling.
+			 */
+			mikey@39 {
+				compatible = "apple,cd3272-mikey";
+				reg = <0x39>;
+				hp-det-gpios = <&pmu 2 GPIO_ACTIVE_HIGH>;
+			};
+
+			/* iOS: interrupt 0x25, lux-scale 200 */
+			light-sensor@44 {
+				compatible = "isil,isl29003";
+				reg = <0x44>;
+			};
+		};
+
+		/*
+		 * The boot NOR flash is on SPI1, not SPI0 (only SPI1 has the
+		 * NOR flash chip attached; SPI0 reads zeros). SPI1:
+		 * device-clocks id 0x23 (0x4c bit 11, 0x6c bit 14), chip select
+		 * GPIO 0x406. Read-only: never written from Linux.
+		 */
+		spi1: spi@3ce00000 {
+			compatible = "apple,s5l8720-spi";
+			reg = <0x3ce00000 0x100>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			clock-frequency = <24000000>;
+			/* SPI1, gated while idle (iOS id 0x23) */
+			clocks = <&clkgate 1 11>, <&clkgate 4 14>;
+			cs-gpios = <&gpio 38 GPIO_ACTIVE_LOW>;
+
+			flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <1000000>;
+
+				/* iOS's NOR layout, all read-only */
+				partitions {
+					compatible = "fixed-partitions";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					nor@0 {
+						label = "nor";
+						reg = <0x0 0x100000>;
+						read-only;
+					};
+					syscfg@4000 {
+						label = "diagnostic-data";
+						reg = <0x4000 0x4000>;
+						read-only;
+					};
+					images@8000 {
+						label = "raw-device";
+						reg = <0x8000 0xf2000>;
+						read-only;
+					};
+					effaceable@fa000 {
+						label = "effaceable";
+						reg = <0xfa000 0x2000>;
+						read-only;
+					};
+					nvram@fc000 {
+						label = "nvram";
+						reg = <0xfc000 0x4000>;
+						read-only;
+					};
+				};
+			};
+		};
+
+		/* SPI4: the Zephyr2 multi-touch controller (CS 0xa07). */
+		spi4: spi@3e100000 {
+			compatible = "apple,s5l8720-spi";
+			reg = <0x3e100000 0x100>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			clock-frequency = <24000000>;
+			/* SPI4, gated while idle (iOS id 0x26) */
+			clocks = <&clkgate 2 4>, <&clkgate 4 20>;
+			cs-gpios = <&gpio 87 GPIO_ACTIVE_LOW>;
+
+			/*
+			 * Zephyr2 (Z2F53) multitouch. Powered by PMU LDO3 at
+			 * 1.8 V (defer probe until the PMU enables it on cold
+			 * boots where LDO3 starts off). Uses SPI mode 3,
+			 * 83 kHz normal and 4.5 MHz for firmware uploads.
+			 */
+			touchscreen@0 {
+				compatible = "apple,n72-multitouch";
+				reg = <0>;
+				spi-max-frequency = <4500000>;
+				spi-cpol;
+				spi-cpha;
+				spi-cs-setup-delay-ns = <10000>;
+				spi-cs-hold-delay-ns = <10000>;
+				vdd-supply = <&ldo3>;
+				/* The data-ready line is active-low. */
+				interrupts-extended = <&gpio 0x6d IRQ_TYPE_LEVEL_LOW>;
+				/* iOS flags 01 01 01 00: reset is active-high. */
+				reset-gpios = <&gpio 86 GPIO_ACTIVE_HIGH>;
+			};
+		};
+
+		/*
+		 * Suspend to RAM through LLB's wake path: the AES engine (UID
+		 * key, for the sleep token; device-clocks id 8: gate 0x48 bit 7)
+		 * and the clock controller (gates saved across the power loss).
+		 */
+		/*
+		 * Display controller and MIPI DSI master; the boot loader runs
+		 * them and simplefb draws. Only used across system sleep (panel
+		 * shutdown and bring-up after suspend to RAM). Panel reset:
+		 * GPIO 0x107 (bank 1 pin 7), low = reset.
+		 */
+		clcd: lcd@38900000 {
+			compatible = "apple,n72-lcd";
+			reg = <0x38900000 0x2000>, <0x3d800000 0x100>;
+			reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
+			/* iOS lcd-panel-id (class 1) */
+			apple,panel-id = <0xa2d10784>;
+			power-supply = <&ldo4>;
+			/*
+			 * CLCD (0x48 bit 14, 0x68 bits 9-11) and MIPI (0x4c bit 19),
+			 * iOS device-clocks ids 0x0c and 0x19: gated while the panel
+			 * is powered down in a sleep.
+			 */
+			clocks = <&clkgate 0 14>, <&clkgate 3 9>, <&clkgate 3 10>,
+				 <&clkgate 3 11>, <&clkgate 1 19>;
+			/* the PMU's backlight: off while the panel restarts */
+			backlight = <&pmu>;
+		};
+
+		sleep@38c00000 {
+			compatible = "apple,n72-sleep";
+			reg = <0x38c00000 0x100>, <0x3c500000 0x100>;
+			clocks = <&clkgate 0 7>;
+			apple,pmu = <&pmu>;
+		};
+
+		wdt: watchdog@3c800000 {
+			compatible = "apple,s5l8723-syscon", "syscon", "simple-mfd";
+			reg = <0x3c800000 0x8>;
+
+			reboot: syscon-reboot {
+				compatible = "syscon-reboot";
+				offset = <0x0>;
+				value = <0x100000>;
+			};
+
+			/*
+			 * iOS wdt@4800000 (interrupt 0x33, unused here). Its clock
+			 * is the bus clock (iOS clock id 2, bus-frequency).
+			 */
+			watchdog {
+				compatible = "apple,s5l8720-wdt";
+				clock-frequency = <133000000>;
+			};
+		};
+	};
+};
