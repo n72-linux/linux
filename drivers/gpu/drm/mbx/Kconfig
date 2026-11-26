@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config APPLE_MBX
+	tristate "PowerVR MBX Lite on Apple S5L8720"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	depends on DRM
+	help
+	  PowerVR MBX Lite GPU in the Apple S5L8720 (iPod touch 2nd
+	  generation): power-on, reset, GPU MMU, buffer allocation and
+	  command submission (2D, 3D blits, tile accelerator frames)
+	  through a DRM render node.
