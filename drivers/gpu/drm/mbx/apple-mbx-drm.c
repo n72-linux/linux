@@ -541,11 +541,21 @@ static int mbx_drm_get_param(struct drm_device *drm, void *data, struct drm_file
 		gp->value = mbx_read(mbx, MBX_REVISION);
 		mutex_unlock(&mbx->lock);
 		return 0;
-	case APPLE_MBX_PARAM_FB_GPU_ADDR: gp->value = mbx->fb.gpu_addr; break;
-	case APPLE_MBX_PARAM_FB_WIDTH: gp->value = mbx->fb.width; break;
-	case APPLE_MBX_PARAM_FB_HEIGHT: gp->value = mbx->fb.height; break;
-	case APPLE_MBX_PARAM_FB_STRIDE: gp->value = mbx->fb.stride; break;
-	case APPLE_MBX_PARAM_FB_FORMAT: gp->value = mbx->fb.format; break;
+	case APPLE_MBX_PARAM_FB_GPU_ADDR:
+		gp->value = mbx->fb.gpu_addr;
+		break;
+	case APPLE_MBX_PARAM_FB_WIDTH:
+		gp->value = mbx->fb.width;
+		break;
+	case APPLE_MBX_PARAM_FB_HEIGHT:
+		gp->value = mbx->fb.height;
+		break;
+	case APPLE_MBX_PARAM_FB_STRIDE:
+		gp->value = mbx->fb.stride;
+		break;
+	case APPLE_MBX_PARAM_FB_FORMAT:
+		gp->value = mbx->fb.format;
+		break;
 	default:
 		return -EINVAL;
 	}
