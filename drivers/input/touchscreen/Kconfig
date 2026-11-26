@@ -24,6 +24,14 @@ config TOUCHSCREEN_88PM860X
 	  To compile this driver as a module, choose M here: the
 	  module will be called 88pm860x-ts.
 
+config TOUCHSCREEN_ZEPHYR2
+	tristate "Apple Zephyr2 multi-touch (iPod touch 2G)"
+	depends on SPI && OF
+	help
+	  Zephyr2 SPI multi-touch controller of the Apple iPod touch 2nd
+	  generation. Needs the controller firmware and calibration as
+	  firmware files.
+
 config TOUCHSCREEN_ADS7846
 	tristate "ADS7846/TSC2046/AD7873 and AD(S)7843 based touchscreens"
 	depends on SPI_MASTER

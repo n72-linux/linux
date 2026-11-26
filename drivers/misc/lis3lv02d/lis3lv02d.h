@@ -301,6 +301,8 @@ struct lis3lv02d {
 
 	struct lis3lv02d_platform_data *pdata;	/* for passing board config */
 	struct mutex		mutex;     /* Serialize poll and selftest */
+	bool			motion_on;    /* "motion": the chip kept on, watching */
+	bool			motion_armed; /* its wake-up units armed (until an event) */
 
 #ifdef CONFIG_OF
 	struct device_node	*of_node;

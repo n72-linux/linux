@@ -720,6 +720,20 @@ config INPUT_PCAP
 	  To compile this driver as a module, choose M here: the
 	  module will be called pcap_keys.
 
+config INPUT_APPLE_CD3272
+	tristate "Apple CD3272 \"Mikey\" headset remote"
+	depends on I2C
+	default ARCH_S5L87XX
+	help
+	  Say Y here if you have an Apple iPod touch / iPhone class device
+	  with the CD3272 "Mikey" headset-remote chip on I2C (address 0x39).
+	  It reports the play/pause, volume and track buttons of Apple
+	  headsets and the microphone-inserted switch. The driver polls
+	  the chip unless an interrupt is described in the device tree.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called apple-cd3272.
+
 config INPUT_ADXL34X
 	tristate "Analog Devices ADXL34x Three-Axis Digital Accelerometer"
 	default n

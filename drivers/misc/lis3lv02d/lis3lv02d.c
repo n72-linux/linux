@@ -483,6 +483,72 @@ static void lis3lv02d_joystick_close(struct input_dev *input)
 		pm_runtime_put(lis3->pm_dev);
 }
 
+/*
+ * Motion wake ("motion" in sysfs; 8-bit parts): instead of reading the
+ * position over and over to notice a turn, the chip's two free-fall/wake-up
+ * units watch for one. Unit 1: the axis gravity lies on now losing
+ * LIS3_MOTION_D of it; unit 2: either other axis gaining LIS3_MOTION_D (the
+ * units compare absolute values with one threshold each). The first event
+ * disarms both and wakes poll() on "position" (POLLPRI); the reader re-arms
+ * around the new position once things settle, by writing 1 again. Writing 0
+ * lets the chip power down.
+ */
+#define LIS3_MOTION_D	8	/* counts of 18 mg: ~0.14 g, ~8 degrees off an axis */
+#define LIS3_MOTION_DUR	3	/* samples at 100 Hz: knocks under 30 ms are not a move */
+
+static void lis3_motion_disarm(struct lis3lv02d *lis3)
+{
+	u8 v;
+
+	lis3->write(lis3, FF_WU_CFG_1, 0);
+	lis3->write(lis3, FF_WU_CFG_2, 0);
+	lis3->read(lis3, FF_WU_SRC_1, &v);	/* (reading clears the latch) */
+	lis3->read(lis3, FF_WU_SRC_2, &v);
+	lis3->motion_armed = false;
+}
+
+/* (mutex held, chip powered) */
+static void lis3_motion_arm(struct lis3lv02d *lis3)
+{
+	static const u8 out[3] = { OUTX, OUTY, OUTZ };
+	static const u8 lie[3] = { FF_WU_CFG_XLIE, FF_WU_CFG_YLIE, FF_WU_CFG_ZLIE };
+	static const u8 hie[3] = { FF_WU_CFG_XHIE, FF_WU_CFG_YHIE, FF_WU_CFG_ZHIE };
+	u8 v, cfg2 = FF_WU_CFG_LIR;
+	int a[3], i, dom = 0, other = 0;
+
+	for (i = 0; i < 3; i++) {
+		a[i] = lis3->read(lis3, out[i], &v) ? 0 : abs((s8)v);
+		if (a[i] > a[dom])
+			dom = i;
+	}
+	for (i = 0; i < 3; i++)
+		if (i != dom) {
+			other = max(other, a[i]);
+			cfg2 |= hie[i];
+		}
+	lis3_motion_disarm(lis3);
+	lis3->write(lis3, FF_WU_THS_1, clamp(a[dom] - LIS3_MOTION_D, 1, 127));
+	lis3->write(lis3, FF_WU_DURATION_1, LIS3_MOTION_DUR);
+	lis3->write(lis3, FF_WU_THS_2, min(other + LIS3_MOTION_D, 127));
+	lis3->write(lis3, FF_WU_DURATION_2, LIS3_MOTION_DUR);
+	lis3->write(lis3, FF_WU_CFG_1, FF_WU_CFG_LIR | lie[dom]);
+	lis3->write(lis3, FF_WU_CFG_2, cfg2);
+	lis3->motion_armed = true;
+}
+
+/* (thread context) a move: disarmed, and poll() on "position" woken */
+static bool lis3_motion_event(struct lis3lv02d *lis3)
+{
+	if (!READ_ONCE(lis3->motion_on))
+		return false;
+	mutex_lock(&lis3->mutex);
+	lis3_motion_disarm(lis3);
+	mutex_unlock(&lis3->mutex);
+	if (lis3->pdev)
+		sysfs_notify(&lis3->pdev->dev.kobj, NULL, "position");
+	return true;
+}
+
 static irqreturn_t lis302dl_interrupt(int irq, void *data)
 {
 	struct lis3lv02d *lis3 = data;
@@ -500,7 +566,7 @@ static irqreturn_t lis302dl_interrupt(int irq, void *data)
 	wake_up_interruptible(&lis3->misc_wait);
 	kill_fasync(&lis3->async_queue, SIGIO, POLL_IN);
 out:
-	if (atomic_read(&lis3->wake_thread))
+	if (atomic_read(&lis3->wake_thread) || READ_ONCE(lis3->motion_on))
 		return IRQ_WAKE_THREAD;
 	return IRQ_HANDLED;
 }
@@ -545,6 +611,10 @@ static irqreturn_t lis302dl_interrupt_thread1_8b(int irq, void *data)
 	struct lis3lv02d *lis3 = data;
 	u8 irq_cfg = lis3->irq_cfg & LIS3_IRQ1_MASK;
 
+	/* (the selftest's data-ready interrupts are its own, not a move) */
+	if (irq_cfg != LIS3_IRQ1_DATA_READY && lis3_motion_event(lis3) &&
+	    !atomic_read(&lis3->wake_thread))
+		return IRQ_HANDLED;
 	if (irq_cfg == LIS3_IRQ1_CLICK)
 		lis302dl_interrupt_handle_click(lis3);
 	else if (unlikely(irq_cfg == LIS3_IRQ1_DATA_READY))
@@ -850,7 +920,57 @@ static ssize_t lis3lv02d_rate_set(struct device *dev,
 	return count;
 }
 
+static ssize_t lis3lv02d_motion_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct lis3lv02d *lis3 = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", lis3->motion_armed);
+}
+
+/* 1: watch for a move from where the iPod is now (again); 0: stop */
+static ssize_t lis3lv02d_motion_set(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct lis3lv02d *lis3 = dev_get_drvdata(dev);
+	bool on;
+	int ret;
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+	if (lis3->whoami != WAI_8B || !lis3->irq)
+		return -EOPNOTSUPP;
+	mutex_lock(&lis3->mutex);
+	if (on) {
+		if (!lis3->motion_on && lis3->pm_dev) {
+			ret = pm_runtime_resume_and_get(lis3->pm_dev);
+			if (ret < 0) {
+				mutex_unlock(&lis3->mutex);
+				return ret;
+			}
+		}
+		lis3_motion_arm(lis3);
+		WRITE_ONCE(lis3->motion_on, true);
+		mutex_unlock(&lis3->mutex);
+		return count;
+	}
+	if (!lis3->motion_on) {
+		mutex_unlock(&lis3->mutex);
+		return count;
+	}
+	WRITE_ONCE(lis3->motion_on, false);
+	lis3_motion_disarm(lis3);
+	mutex_unlock(&lis3->mutex);
+	if (lis3->pm_dev)
+		pm_runtime_put(lis3->pm_dev);
+	return count;
+}
+
 static DEVICE_ATTR(selftest, S_IRUSR, lis3lv02d_selftest_show, NULL);
+static DEVICE_ATTR(motion, S_IRUGO | S_IWUSR, lis3lv02d_motion_show,
+		   lis3lv02d_motion_set);
 static DEVICE_ATTR(position, S_IRUGO, lis3lv02d_position_show, NULL);
 static DEVICE_ATTR(rate, S_IRUGO | S_IWUSR, lis3lv02d_rate_show,
 					    lis3lv02d_rate_set);
@@ -858,6 +978,7 @@ static DEVICE_ATTR(rate, S_IRUGO | S_IWUSR, lis3lv02d_rate_show,
 static struct attribute *lis3lv02d_attributes[] = {
 	&dev_attr_selftest.attr,
 	&dev_attr_position.attr,
+	&dev_attr_motion.attr,
 	&dev_attr_rate.attr,
 	NULL
 };
@@ -879,9 +1000,20 @@ static int lis3lv02d_add_fs(struct lis3lv02d *lis3)
 
 void lis3lv02d_remove_fs(struct lis3lv02d *lis3)
 {
+	bool put_motion = false;
+
 	sysfs_remove_group(&lis3->pdev->dev.kobj, &lis3lv02d_attribute_group);
 	platform_device_unregister(lis3->pdev);
+	mutex_lock(&lis3->mutex);
+	if (lis3->motion_on) {
+		WRITE_ONCE(lis3->motion_on, false);
+		lis3_motion_disarm(lis3);
+		put_motion = true;
+	}
+	mutex_unlock(&lis3->mutex);
 	if (lis3->pm_dev) {
+		if (put_motion)
+			pm_runtime_put_noidle(lis3->pm_dev);
 		/* Barrier after the sysfs remove */
 		pm_runtime_barrier(lis3->pm_dev);
 
