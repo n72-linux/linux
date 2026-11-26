@@ -263,6 +263,33 @@
 					 APPLE_S5L_UCON_RXTHRESH_ENA_MSK | \
 					 APPLE_S5L_UCON_TXTHRESH_ENA_MSK)
 
+/*
+ * Mode fields for Apple UART variants: 1 is interrupt mode (as on Samsung
+ * parts), 3 is DMA mode (never 2).
+ */
+#define APPLE_S5L_UCON_TXMODE_DMA	(3 << 2)
+#define APPLE_S5L_UCON_RXMODE_DMA	(3 << 0)
+/*
+ * S5L8720 (iOS "uart-version" 1): UBRDIV[19:16] = 16 - samples per bit
+ * (16 down to 4), and two registers of per-bit-cell sample corrections.
+ */
+#define APPLE_S5L8720_UBRDIV_OS_SHIFT	16
+#define APPLE_S5L8720_USLOT0		0x34
+#define APPLE_S5L8720_USLOT1		0x38
+/*
+ * What iOS writes to UFCON for a rate (FIFO on; [5:4] RX trigger 4/8/12/16
+ * bytes, [7:6] TX trigger 0/4/8/12, [9:8] not understood, never 0 there):
+ * the RX trigger is the FIFO depth less the characters arriving in 200 us.
+ */
+#define APPLE_S5L8720_UFCON_SLOW	0x261	/* trigger 12 and more: to 230400 */
+#define APPLE_S5L8720_UFCON_MID		0x291	/* 8 to 11 */
+#define APPLE_S5L8720_UFCON_FAST	0x1c1	/* 7 and fewer: 460800 and up */
+/*
+ * Resets UCON: a write with it set reads back 0 (seen on the N72). iOS
+ * writes it at every port reset; nothing here needs it.
+ */
+#define APPLE_S5L8720_UCON_RESET	BIT(20)
+
 #define APPLE_S5L_UTRSTAT_RXTO_LEGACY	BIT(3)
 #define APPLE_S5L_UTRSTAT_RXTHRESH	BIT(4)
 #define APPLE_S5L_UTRSTAT_TXTHRESH	BIT(5)

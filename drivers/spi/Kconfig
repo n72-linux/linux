@@ -957,6 +957,13 @@ config SPI_QCOM_GENI
 	  This driver can also be built as a module.  If so, the module
 	  will be called spi-geni-qcom.
 
+config SPI_S5L8720
+	tristate "Samsung/Apple S5L8720 SPI controller"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	help
+	  SPI controller of the Samsung/Apple S5L8720 (iPod touch 2nd
+	  generation), used for its NOR flash and touchscreen.
+
 config SPI_S5L8702
 	tristate "Samsung/Apple S5L8702 SPI controller"
 	depends on (ARCH_S5L87XX || COMPILE_TEST)

@@ -90,6 +90,7 @@ struct s3c24xx_uart_info {
 
 	/* uart port features */
 	bool			has_divslot;
+	bool			has_oversampling;
 };
 
 struct s3c24xx_serial_drv_data {
@@ -126,6 +127,9 @@ struct s3c24xx_uart_dma {
 
 	int				tx_bytes_requested;
 	int				rx_bytes_requested;
+
+	/* Apple ports: read position in the receive ring */
+	unsigned int			rx_pos;
 };
 
 struct s3c24xx_uart_port {
@@ -305,11 +309,12 @@ static void s3c24xx_serial_stop_tx(struct uart_port *port)
 	if (dma && dma->tx_chan && ourport->tx_in_progress == S3C24XX_TX_DMA) {
 		dmaengine_pause(dma->tx_chan);
 		dmaengine_tx_status(dma->tx_chan, dma->tx_cookie, &state);
+		/* (before the terminate: the PL080's driver frees the descriptor in it) */
+		async_tx_ack(dma->tx_desc);
 		dmaengine_terminate_all(dma->tx_chan);
 		dma_sync_single_for_cpu(dma->tx_chan->device->dev,
 					dma->tx_transfer_addr, dma->tx_size,
 					DMA_TO_DEVICE);
-		async_tx_ack(dma->tx_desc);
 		count = dma->tx_bytes_requested - state.residue;
 		uart_xmit_advance(port, count);
 	}
@@ -321,6 +326,24 @@ static void s3c24xx_serial_stop_tx(struct uart_port *port)
 		s3c24xx_serial_rx_enable(port);
 
 	ourport->tx_mode = 0;
+}
+
+/*
+ * The serial core has just emptied the transmit buffer (port lock held). A
+ * DMA block still on its way was taken from that buffer: stop it and forget
+ * it. Counting its bytes later would move the emptied buffer's read position
+ * past its write position, and a buffer's worth of old bytes would go out.
+ */
+static void s3c24xx_serial_flush_buffer(struct uart_port *port)
+{
+	struct s3c24xx_uart_port *ourport = to_ourport(port);
+	struct s3c24xx_uart_dma *dma = ourport->dma;
+
+	if (dma && dma->tx_chan && ourport->tx_in_progress == S3C24XX_TX_DMA) {
+		async_tx_ack(dma->tx_desc);
+		dmaengine_terminate_all(dma->tx_chan);
+		ourport->tx_in_progress = 0;
+	}
 }
 
 static void s3c24xx_serial_start_next_tx(struct s3c24xx_uart_port *ourport);
@@ -335,15 +358,25 @@ static void s3c24xx_serial_tx_dma_complete(void *args)
 	unsigned long flags;
 	int count;
 
-	dmaengine_tx_status(dma->tx_chan, dma->tx_cookie, &state);
+	uart_port_lock_irqsave(port, &flags);
+
+	/*
+	 * Not the block this callback was queued for: that one was stopped
+	 * (stop_tx, flush_buffer) after it had completed, and nothing or a
+	 * later block is under way now. Its bytes are not counted twice, and
+	 * not against a buffer that was emptied meanwhile.
+	 */
+	if (ourport->tx_in_progress != S3C24XX_TX_DMA ||
+	    dmaengine_tx_status(dma->tx_chan, dma->tx_cookie, &state) != DMA_COMPLETE) {
+		uart_port_unlock_irqrestore(port, flags);
+		return;
+	}
 	count = dma->tx_bytes_requested - state.residue;
 	async_tx_ack(dma->tx_desc);
 
 	dma_sync_single_for_cpu(dma->tx_chan->device->dev,
 				dma->tx_transfer_addr, dma->tx_size,
 				DMA_TO_DEVICE);
-
-	uart_port_lock_irqsave(port, &flags);
 
 	uart_xmit_advance(port, count);
 	ourport->tx_in_progress = 0;
@@ -366,8 +399,21 @@ static void enable_tx_dma(struct s3c24xx_uart_port *ourport)
 		s3c24xx_set_bit(port, S3C64XX_UINTM_TXD, S3C64XX_UINTM);
 		break;
 	case TYPE_APPLE_S5L:
-		WARN_ON(1); // No DMA
-		break;
+		/*
+		 * No TX threshold interrupt, mode 3. Nothing else in UCON: the
+		 * S3C64xx burst fields have different meanings on this port.
+		 * UFCON is left untouched while the port runs. The PL080 hands
+		 * bytes over one by one and reports the end of the block.
+		 */
+		ucon = rd_regl(port, S3C2410_UCON);
+		if ((ucon & (APPLE_S5L_UCON_TXTHRESH_ENA_MSK | S3C64XX_UCON_TXMODE_MASK)) !=
+		    APPLE_S5L_UCON_TXMODE_DMA) {
+			ucon &= ~(APPLE_S5L_UCON_TXTHRESH_ENA_MSK | S3C64XX_UCON_TXMODE_MASK);
+			ucon |= APPLE_S5L_UCON_TXMODE_DMA;
+			wr_regl(port, S3C2410_UCON, ucon);
+		}
+		ourport->tx_mode = S3C24XX_TX_DMA;
+		return;
 	default:
 		disable_irq_nosync(ourport->tx_irq);
 		break;
@@ -430,6 +476,16 @@ static void s3c24xx_serial_start_tx_pio(struct s3c24xx_uart_port *ourport)
 		enable_tx_pio(ourport);
 }
 
+/*
+ * The Samsung code sends whole cache lines only. Outgoing data is merely
+ * written back from the cache, which does its neighbours in a line no
+ * harm, so the Apple ports send from any address and any length.
+ */
+static unsigned int s3c24xx_serial_tx_dma_align(const struct s3c24xx_uart_port *ourport)
+{
+	return ourport->info->type == TYPE_APPLE_S5L ? 1 : dma_get_cache_alignment();
+}
+
 static int s3c24xx_serial_start_tx_dma(struct s3c24xx_uart_port *ourport,
 				      unsigned int count, unsigned int tail)
 {
@@ -438,7 +494,7 @@ static int s3c24xx_serial_start_tx_dma(struct s3c24xx_uart_port *ourport,
 	if (ourport->tx_mode != S3C24XX_TX_DMA)
 		enable_tx_dma(ourport);
 
-	dma->tx_size = count & ~(dma_get_cache_alignment() - 1);
+	dma->tx_size = count & ~(s3c24xx_serial_tx_dma_align(ourport) - 1);
 	dma->tx_transfer_addr = dma->tx_addr + tail;
 
 	dma_sync_single_for_device(dma->tx_chan->device->dev,
@@ -479,7 +535,7 @@ static void s3c24xx_serial_start_next_tx(struct s3c24xx_uart_port *ourport)
 
 	if (!ourport->dma || !ourport->dma->tx_chan ||
 	    count < ourport->min_dma_size ||
-	    tail & (dma_get_cache_alignment() - 1))
+	    tail & (s3c24xx_serial_tx_dma_align(ourport) - 1))
 		s3c24xx_serial_start_tx_pio(ourport);
 	else
 		s3c24xx_serial_start_tx_dma(ourport, count, tail);
@@ -531,6 +587,8 @@ static void s3c24xx_uart_copy_rx_to_tty(struct s3c24xx_uart_port *ourport,
 	}
 }
 
+static void apple_serial_stop_rx_dma(struct s3c24xx_uart_port *ourport);
+
 static void s3c24xx_serial_stop_rx(struct uart_port *port)
 {
 	struct s3c24xx_uart_port *ourport = to_ourport(port);
@@ -557,6 +615,10 @@ static void s3c24xx_serial_stop_rx(struct uart_port *port)
 			break;
 		}
 		ourport->rx_enabled = 0;
+	}
+	if (ourport->info->type == TYPE_APPLE_S5L) {
+		apple_serial_stop_rx_dma(ourport);
+		return;
 	}
 	if (dma && dma->rx_chan) {
 		dmaengine_pause(dma->tx_chan);
@@ -854,8 +916,184 @@ static irqreturn_t s3c24xx_serial_rx_chars_pio(struct s3c24xx_uart_port *ourport
 	return IRQ_HANDLED;
 }
 
+/*
+ * Apple ports: reception by DMA. The PL080 writes the port's bytes into a
+ * ring that it advances on its own; the port's receive timeout interrupt
+ * signals that a packet has ended, and arriving bytes are read from the
+ * PL080's position. Normally after a timeout the port drains trailing bytes
+ * below the FIFO trigger to the PL080 as well; if any remain in the FIFO,
+ * drain them manually with the port's DMA requests temporarily off.
+ *
+ * Received by interrupt, a busy Bluetooth link costs one interrupt per four
+ * to nine bytes (phone audio into the N72, 9 kB/s: 2300 interrupts/s).
+ *
+ * iOS's ring is 8 KiB, but iOS arms the PL080 a quarter of the ring at a
+ * time and only as far as the reader has come, so a slow reader stops the
+ * sender through the FIFO and CTS. A cyclic transfer goes on round and
+ * writes over what has not been read, and dmaengine has no lap count to
+ * see it by: the ring is twice the size instead (at 3 Mbaud, 48 ms from a
+ * period interrupt to the read before anything is lost).
+ */
+#define APPLE_RX_DMA_SIZE	16384
+#define APPLE_RX_DMA_PERIOD	2048
+
+static bool apple_serial_rx_dma(const struct s3c24xx_uart_port *ourport)
+{
+	return ourport->info->type == TYPE_APPLE_S5L && ourport->dma &&
+	       ourport->dma->rx_chan && ourport->rx_mode == S3C24XX_RX_DMA;
+}
+
+/* port lock held: hand over what the PL080 has written since the last time */
+static void apple_serial_rx_dma_push(struct s3c24xx_uart_port *ourport)
+{
+	struct s3c24xx_uart_dma *dma = ourport->dma;
+	struct uart_port *port = &ourport->port;
+	struct tty_port *t = &port->state->port;
+	struct dma_tx_state state;
+	unsigned int pos, got = 0;
+
+	if (dmaengine_tx_status(dma->rx_chan, dma->rx_cookie, &state) == DMA_ERROR)
+		return;
+	/* what is left of this round of the ring */
+	pos = (dma->rx_size - min_t(size_t, state.residue, dma->rx_size)) % dma->rx_size;
+
+	while (dma->rx_pos != pos) {
+		unsigned int end = pos > dma->rx_pos ? pos : dma->rx_size;
+		unsigned int len = end - dma->rx_pos;
+		int copied;
+
+		dma_sync_single_for_cpu(dma->rx_chan->device->dev,
+					dma->rx_addr + dma->rx_pos, len, DMA_FROM_DEVICE);
+		copied = tty_insert_flip_string(t, dma->rx_buf + dma->rx_pos, len);
+		port->icount.rx += len;
+		if (copied != len)
+			port->icount.buf_overrun += len - copied;
+		dma->rx_pos = end % dma->rx_size;
+		got += len;
+	}
+	if (got)
+		tty_flip_buffer_push(t);
+}
+
+/* a quarter of the ring has filled */
+static void apple_serial_rx_dma_period(void *args)
+{
+	struct s3c24xx_uart_port *ourport = args;
+	struct uart_port *port = &ourport->port;
+	unsigned long flags;
+
+	uart_port_lock_irqsave(port, &flags);
+	if (apple_serial_rx_dma(ourport))
+		apple_serial_rx_dma_push(ourport);
+	uart_port_unlock_irqrestore(port, flags);
+}
+
+/* the port's receive timeout (or threshold) interrupt in DMA mode */
+static irqreturn_t apple_serial_rx_dma_irq(struct s3c24xx_uart_port *ourport)
+{
+	struct uart_port *port = &ourport->port;
+	unsigned int cnt = 0, last = port->fifosize + 1, tries;
+	u32 uerstat, ucon;
+
+	uart_port_lock(port);
+
+	/* errors cannot be pinned to a byte here: counted only, as under iOS */
+	uerstat = rd_regl(port, S3C2410_UERSTAT);
+	if (uerstat & S3C2410_UERSTAT_OVERRUN)
+		port->icount.overrun++;
+	if (uerstat & S3C2410_UERSTAT_BREAK)
+		port->icount.brk++;
+	else if (uerstat & S3C2410_UERSTAT_FRAME)
+		port->icount.frame++;
+
+	/*
+	 * iOS's wait for the PL080 to take the rest: the FIFO level must
+	 * keep falling (SYNC 8052350c). A byte takes the PL080 well under a
+	 * microsecond.
+	 */
+	for (tries = 0; tries < 2 * port->fifosize; tries++) {
+		cnt = s3c24xx_serial_rx_fifocnt(ourport, rd_regl(port, S3C2410_UFSTAT));
+		if (!cnt || cnt >= last)
+			break;
+		last = cnt;
+		udelay(1);
+	}
+	apple_serial_rx_dma_push(ourport);
+
+	if (cnt) {
+		/* not taken: by hand, in order, with no DMA request meanwhile */
+		ucon = rd_regl(port, S3C2410_UCON);
+		wr_regl(port, S3C2410_UCON,
+			(ucon & ~S3C64XX_UCON_RXMODE_MASK) | S3C64XX_UCON_RXMODE_CPU);
+		udelay(2);
+		apple_serial_rx_dma_push(ourport);
+		s3c24xx_serial_rx_drain_fifo(ourport);
+		tty_flip_buffer_push(&port->state->port);
+		wr_regl(port, S3C2410_UCON, ucon);
+	}
+
+	uart_port_unlock(port);
+	return IRQ_HANDLED;
+}
+
+/* port open, interrupts set up for reception by interrupt: over to the PL080 */
+static int apple_serial_start_rx_dma(struct s3c24xx_uart_port *ourport)
+{
+	struct s3c24xx_uart_dma *dma = ourport->dma;
+	struct uart_port *port = &ourport->port;
+	unsigned long flags;
+	u32 ucon;
+
+	dma->rx_desc = dmaengine_prep_dma_cyclic(dma->rx_chan, dma->rx_addr,
+						 dma->rx_size, APPLE_RX_DMA_PERIOD,
+						 DMA_DEV_TO_MEM, DMA_PREP_INTERRUPT);
+	if (!dma->rx_desc)
+		return -EIO;
+	dma->rx_desc->callback = apple_serial_rx_dma_period;
+	dma->rx_desc->callback_param = ourport;
+	dma->rx_pos = 0;
+	dma->rx_cookie = dmaengine_submit(dma->rx_desc);
+	dma_async_issue_pending(dma->rx_chan);
+
+	uart_port_lock_irqsave(port, &flags);
+	/*
+	 * Mode 3, no threshold interrupt (it would come every few bytes and
+	 * has nothing to do), and the timeout armed afresh as iOS does after
+	 * starting (805ef1f0: its two bits low, then back).
+	 */
+	ucon = rd_regl(port, S3C2410_UCON);
+	ucon &= ~(S3C64XX_UCON_RXMODE_MASK | APPLE_S5L_UCON_RXTHRESH_ENA_MSK);
+	ucon |= APPLE_S5L_UCON_RXMODE_DMA;
+	wr_regl(port, S3C2410_UCON, ucon & ~(S3C2410_UCON_RXFIFO_TOI |
+					     APPLE_S5L_UCON_RXTO_LEGACY_ENA_MSK));
+	wr_regl(port, S3C2410_UCON, ucon | S3C2410_UCON_RXFIFO_TOI |
+				    APPLE_S5L_UCON_RXTO_LEGACY_ENA_MSK);
+	ourport->rx_mode = S3C24XX_RX_DMA;
+	uart_port_unlock_irqrestore(port, flags);
+	return 0;
+}
+
+/* port lock held */
+static void apple_serial_stop_rx_dma(struct s3c24xx_uart_port *ourport)
+{
+	struct uart_port *port = &ourport->port;
+	u32 ucon;
+
+	if (!apple_serial_rx_dma(ourport))
+		return;
+	ucon = rd_regl(port, S3C2410_UCON);
+	wr_regl(port, S3C2410_UCON,
+		(ucon & ~S3C64XX_UCON_RXMODE_MASK) | S3C64XX_UCON_RXMODE_CPU);
+	apple_serial_rx_dma_push(ourport);
+	ourport->rx_mode = S3C24XX_RX_PIO;
+	dmaengine_terminate_async(ourport->dma->rx_chan);
+}
+
 static irqreturn_t s3c24xx_serial_rx_irq(struct s3c24xx_uart_port *ourport)
 {
+	if (ourport->info->type == TYPE_APPLE_S5L)
+		return apple_serial_rx_dma(ourport) ? apple_serial_rx_dma_irq(ourport) :
+						      s3c24xx_serial_rx_chars_pio(ourport);
 	if (ourport->dma && ourport->dma->rx_chan)
 		return s3c24xx_serial_rx_chars_dma(ourport);
 	return s3c24xx_serial_rx_chars_pio(ourport);
@@ -871,8 +1109,9 @@ static void s3c24xx_serial_tx_chars(struct s3c24xx_uart_port *ourport)
 
 	if (ourport->dma && ourport->dma->tx_chan &&
 	    count >= ourport->min_dma_size) {
-		int align = dma_get_cache_alignment() -
-			(tail & (dma_get_cache_alignment() - 1));
+		unsigned int a = s3c24xx_serial_tx_dma_align(ourport);
+		int align = a > 1 ? a - (tail & (a - 1)) : 0;
+
 		if (count - align >= ourport->min_dma_size) {
 			dma_count = count - align;
 			count = align;
@@ -893,6 +1132,12 @@ static void s3c24xx_serial_tx_chars(struct s3c24xx_uart_port *ourport)
 
 	if (kfifo_is_empty(&tport->xmit_fifo) || uart_tx_stopped(port)) {
 		s3c24xx_serial_stop_tx(port);
+		return;
+	}
+
+	/* nothing to send by hand ahead of the block (Apple ports) */
+	if (!count && dma_count) {
+		s3c24xx_serial_start_tx_dma(ourport, dma_count, tail);
 		return;
 	}
 
@@ -1050,6 +1295,13 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 	struct s3c24xx_uart_dma	*dma = p->dma;
 	struct dma_slave_caps dma_caps;
 	const char *reason = NULL;
+	/*
+	 * The Apple ports: the "tx" channel is what matters, "rx" is taken
+	 * if the device tree gives one (apple_serial_start_rx_dma()). Their
+	 * PL080 reports progress within a block although it only promises it
+	 * per segment.
+	 */
+	bool apple = p->info->type == TYPE_APPLE_S5L;
 	int ret;
 
 	/* Default slave configuration parameters */
@@ -1064,33 +1316,40 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 	dma->tx_conf.dst_maxburst	= 1;
 
 	dma->rx_chan = dma_request_chan(p->port.dev, "rx");
-
 	if (IS_ERR(dma->rx_chan)) {
-		reason = "DMA RX channel request failed";
 		ret = PTR_ERR(dma->rx_chan);
-		goto err_warn;
+		dma->rx_chan = NULL;
+		if (!apple) {
+			reason = "DMA RX channel request failed";
+			goto err_warn;
+		}
 	}
 
-	ret = dma_get_slave_caps(dma->rx_chan, &dma_caps);
-	if (ret < 0 ||
-	    dma_caps.residue_granularity < DMA_RESIDUE_GRANULARITY_BURST) {
-		reason = "insufficient DMA RX engine capabilities";
-		ret = -EOPNOTSUPP;
-		goto err_release_rx;
-	}
+	if (dma->rx_chan) {
+		ret = dma_get_slave_caps(dma->rx_chan, &dma_caps);
+		if (ret < 0 ||
+		    dma_caps.residue_granularity < (apple ? DMA_RESIDUE_GRANULARITY_SEGMENT :
+							    DMA_RESIDUE_GRANULARITY_BURST)) {
+			reason = "insufficient DMA RX engine capabilities";
+			ret = -EOPNOTSUPP;
+			goto err_release_rx;
+		}
 
-	dmaengine_slave_config(dma->rx_chan, &dma->rx_conf);
+		dmaengine_slave_config(dma->rx_chan, &dma->rx_conf);
+	}
 
 	dma->tx_chan = dma_request_chan(p->port.dev, "tx");
 	if (IS_ERR(dma->tx_chan)) {
 		reason = "DMA TX channel request failed";
 		ret = PTR_ERR(dma->tx_chan);
+		dma->tx_chan = NULL;
 		goto err_release_rx;
 	}
 
 	ret = dma_get_slave_caps(dma->tx_chan, &dma_caps);
 	if (ret < 0 ||
-	    dma_caps.residue_granularity < DMA_RESIDUE_GRANULARITY_BURST) {
+	    dma_caps.residue_granularity < (apple ? DMA_RESIDUE_GRANULARITY_SEGMENT :
+						    DMA_RESIDUE_GRANULARITY_BURST)) {
 		reason = "insufficient DMA TX engine capabilities";
 		ret = -EOPNOTSUPP;
 		goto err_release_tx;
@@ -1098,21 +1357,23 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 
 	dmaengine_slave_config(dma->tx_chan, &dma->tx_conf);
 
-	/* RX buffer */
-	dma->rx_size = PAGE_SIZE;
+	if (dma->rx_chan) {
+		/* RX buffer: a ring on the Apple ports */
+		dma->rx_size = apple ? APPLE_RX_DMA_SIZE : PAGE_SIZE;
 
-	dma->rx_buf = kmalloc(dma->rx_size, GFP_KERNEL);
-	if (!dma->rx_buf) {
-		ret = -ENOMEM;
-		goto err_release_tx;
-	}
+		dma->rx_buf = kmalloc(dma->rx_size, GFP_KERNEL);
+		if (!dma->rx_buf) {
+			ret = -ENOMEM;
+			goto err_release_tx;
+		}
 
-	dma->rx_addr = dma_map_single(dma->rx_chan->device->dev, dma->rx_buf,
-				      dma->rx_size, DMA_FROM_DEVICE);
-	if (dma_mapping_error(dma->rx_chan->device->dev, dma->rx_addr)) {
-		reason = "DMA mapping error for RX buffer";
-		ret = -EIO;
-		goto err_free_rx;
+		dma->rx_addr = dma_map_single(dma->rx_chan->device->dev, dma->rx_buf,
+					      dma->rx_size, DMA_FROM_DEVICE);
+		if (dma_mapping_error(dma->rx_chan->device->dev, dma->rx_addr)) {
+			reason = "DMA mapping error for RX buffer";
+			ret = -EIO;
+			goto err_free_rx;
+		}
 	}
 
 	/* TX buffer */
@@ -1129,14 +1390,20 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 	return 0;
 
 err_unmap_rx:
-	dma_unmap_single(dma->rx_chan->device->dev, dma->rx_addr,
-			 dma->rx_size, DMA_FROM_DEVICE);
+	if (dma->rx_chan)
+		dma_unmap_single(dma->rx_chan->device->dev, dma->rx_addr,
+				 dma->rx_size, DMA_FROM_DEVICE);
 err_free_rx:
-	kfree(dma->rx_buf);
+	if (dma->rx_chan)
+		kfree(dma->rx_buf);
 err_release_tx:
 	dma_release_channel(dma->tx_chan);
+	dma->tx_chan = NULL;
 err_release_rx:
-	dma_release_channel(dma->rx_chan);
+	if (dma->rx_chan) {
+		dma_release_channel(dma->rx_chan);
+		dma->rx_chan = NULL;
+	}
 err_warn:
 	if (reason)
 		dev_warn(p->port.dev, "%s, DMA will not be used\n", reason);
@@ -1149,6 +1416,7 @@ static void s3c24xx_serial_release_dma(struct s3c24xx_uart_port *p)
 
 	if (dma->rx_chan) {
 		dmaengine_terminate_all(dma->rx_chan);
+		dmaengine_synchronize(dma->rx_chan);
 		dma_unmap_single(dma->rx_chan->device->dev, dma->rx_addr,
 				 dma->rx_size, DMA_FROM_DEVICE);
 		kfree(dma->rx_buf);
@@ -1265,10 +1533,21 @@ static int apple_s5l_serial_startup(struct uart_port *port)
 
 	wr_regl(port, S3C2410_UTRSTAT, APPLE_S5L_UTRSTAT_ALL_FLAGS);
 
+	if (ourport->dma) {
+		ret = s3c24xx_serial_request_dma(ourport);
+		if (ret < 0) {
+			devm_kfree(port->dev, ourport->dma);
+			ourport->dma = NULL;
+		}
+	}
+
 	ret = request_irq(port->irq, apple_serial_handle_irq, 0,
 			  s3c24xx_serial_portname(port), ourport);
 	if (ret) {
 		dev_err(port->dev, "cannot get irq %d\n", port->irq);
+		/* the serial core does not call shutdown after a failed startup */
+		if (ourport->dma)
+			s3c24xx_serial_release_dma(ourport);
 		return ret;
 	}
 
@@ -1292,6 +1571,9 @@ static int apple_s5l_serial_startup(struct uart_port *port)
 	s3c24xx_set_bit(port, APPLE_S5L_UCON_RXTHRESH_ENA, S3C2410_UCON);
 	s3c24xx_set_bit(port, APPLE_S5L_UCON_RXTO_ENA, S3C2410_UCON);
 	s3c24xx_set_bit(port, APPLE_S5L_UCON_RXTO_LEGACY_ENA, S3C2410_UCON);
+
+	if (ourport->dma && ourport->dma->rx_chan && apple_serial_start_rx_dma(ourport))
+		dev_warn(port->dev, "receive DMA could not start: receiving by interrupt\n");
 
 	return ret;
 }
@@ -1402,7 +1684,29 @@ static unsigned int s3c24xx_serial_getclk(struct s3c24xx_uart_port *ourport,
 			continue;
 		}
 
-		if (ourport->info->has_divslot) {
+		if (ourport->info->has_oversampling) {
+			/*
+			 * 16 down to 4 samples per bit and a whole divisor:
+			 * the closest rate, with as many samples as it allows
+			 * (3 Mbaud from 24 MHz is 8 samples, divisor 1, as
+			 * iOS programs it). quot is the register value + 1:
+			 * divisor - 1 below the samples field.
+			 */
+			unsigned int os, div, dev, best_dev = UINT_MAX;
+
+			quot = 1;
+			baud = 0;
+			for (os = 16; os >= 4; os--) {
+				div = DIV_ROUND_CLOSEST(rate, os * req_baud);
+				div = clamp(div, 1U, 0x10000U);
+				dev = abs((int)(rate / (os * div)) - (int)req_baud);
+				if (dev < best_dev) {
+					best_dev = dev;
+					baud = rate / (os * div);
+					quot = div + ((16 - os) << APPLE_S5L8720_UBRDIV_OS_SHIFT);
+				}
+			}
+		} else if (ourport->info->has_divslot) {
 			unsigned long div = rate / req_baud;
 
 			/* The UDIVSLOT register on the newer UARTs allows us to
@@ -1566,8 +1870,31 @@ static void s3c24xx_serial_set_termios(struct uart_port *port,
 		"setting ulcon to %08x, brddiv to %d, udivslot %08x\n",
 		ulcon, quot, udivslot);
 
-	wr_regl(port, S3C2410_ULCON, ulcon);
-	wr_regl(port, S3C2410_UBRDIV, quot);
+	if (ourport->info->has_oversampling) {
+		/*
+		 * Hardware baud-rate programming sequence (in order): FIFO
+		 * levels, divider, sample corrections, then line format.
+		 */
+		unsigned int frame = 2 * tty_get_char_size(termios->c_cflag) +
+				     (termios->c_cflag & CSTOPB ? 4 : 2) +
+				     (termios->c_cflag & PARENB ? 4 : 2);
+		unsigned int thr = 2 * baud < frame * 5000 * 16 ?
+				   16 - 2 * baud / (frame * 5000) : 1;
+
+		u32 ufcon = thr <= 7 ? APPLE_S5L8720_UFCON_FAST :
+			    thr <= 11 ? APPLE_S5L8720_UFCON_MID :
+					APPLE_S5L8720_UFCON_SLOW;
+
+		wr_regl(port, S3C2410_UFCON, ufcon);
+		wr_regl(port, S3C2410_UBRDIV, quot);
+		/* no per-cell corrections: the rates in use are within 1 % */
+		wr_regl(port, APPLE_S5L8720_USLOT0, 0);
+		wr_regl(port, APPLE_S5L8720_USLOT1, 0);
+		wr_regl(port, S3C2410_ULCON, ulcon);
+	} else {
+		wr_regl(port, S3C2410_ULCON, ulcon);
+		wr_regl(port, S3C2410_UBRDIV, quot);
+	}
 
 	port->status &= ~UPSTAT_AUTOCTS;
 
@@ -1714,6 +2041,7 @@ static const struct uart_ops apple_s5l_serial_ops = {
 	.stop_tx	= s3c24xx_serial_stop_tx,
 	.start_tx	= s3c24xx_serial_start_tx,
 	.stop_rx	= s3c24xx_serial_stop_rx,
+	.flush_buffer	= s3c24xx_serial_flush_buffer,
 	.break_ctl	= s3c24xx_serial_break_ctl,
 	.startup	= apple_s5l_serial_startup,
 	.shutdown	= apple_s5l_serial_shutdown,
@@ -2027,6 +2355,18 @@ static int s3c24xx_serial_probe(struct platform_device *pdev)
 	 */
 	ourport->min_dma_size = max_t(int, ourport->port.fifosize,
 				    dma_get_cache_alignment());
+	/*
+	 * An Apple port with a DMA channel sends everything through it, a
+	 * single byte too, as iOS does for Bluetooth: the port then stays in
+	 * DMA mode and is never switched between the two ways of sending
+	 * with bytes still in its FIFO. On the N72, with short pieces still
+	 * sent by interrupt between the blocks (and Linux's FIFO levels), the
+	 * BCM4325 reported damaged data about once every five blocks and its
+	 * patch download failed on two of three cold boots; sending
+	 * everything by DMA with iOS's FIFO levels, neither happened.
+	 */
+	if (ourport->info->type == TYPE_APPLE_S5L)
+		ourport->min_dma_size = 1;
 
 	dev_dbg(&pdev->dev, "%s: initialising port %p...\n", __func__, ourport);
 
@@ -2151,12 +2491,16 @@ static int s3c24xx_serial_resume_noirq(struct device *dev)
 				  APPLE_S5L_UCON_RXTO_ENA_MSK |
 				  APPLE_S5L_UCON_RXTO_LEGACY_ENA_MSK);
 
-			if (ourport->tx_enabled)
+			/* not while a block is being sent by DMA */
+			if (ourport->tx_enabled && ourport->tx_mode != S3C24XX_TX_DMA)
 				ucon |= APPLE_S5L_UCON_TXTHRESH_ENA_MSK;
 			if (ourport->rx_enabled)
 				ucon |= APPLE_S5L_UCON_RXTHRESH_ENA_MSK |
 					APPLE_S5L_UCON_RXTO_ENA_MSK |
 					APPLE_S5L_UCON_RXTO_LEGACY_ENA_MSK;
+			/* receiving by DMA: no threshold interrupt */
+			if (ourport->rx_mode == S3C24XX_RX_DMA)
+				ucon &= ~APPLE_S5L_UCON_RXTHRESH_ENA_MSK;
 
 			wr_regl(port, S3C2410_UCON, ucon);
 
@@ -2570,9 +2914,37 @@ static const struct s3c24xx_serial_drv_data s5l_serial_drv_data = {
 		.ufcon		= S3C2410_UFCON_DEFAULT,
 	},
 };
+/* iPod touch 2G: the same port with selectable oversampling (to 6 Mbaud) */
+static const struct s3c24xx_serial_drv_data s5l8720_serial_drv_data = {
+	.info = {
+		.name		= "Apple S5L8720 UART",
+		.type		= TYPE_APPLE_S5L,
+		.port_type	= PORT_8250,
+		.iotype		= UPIO_MEM32,
+		.fifosize	= 16,
+		.rx_fifomask	= S3C2410_UFSTAT_RXMASK,
+		.rx_fifoshift	= S3C2410_UFSTAT_RXSHIFT,
+		.rx_fifofull	= S3C2410_UFSTAT_RXFULL,
+		.tx_fifofull	= S3C2410_UFSTAT_TXFULL,
+		.tx_fifomask	= S3C2410_UFSTAT_TXMASK,
+		.tx_fifoshift	= S3C2410_UFSTAT_TXSHIFT,
+		.def_clk_sel	= S3C2410_UCON_CLKSEL0,
+		.num_clks	= 1,
+		.clksel_mask	= 0,
+		.clksel_shift	= 0,
+		.ucon_mask	= APPLE_S5L_UCON_MASK,
+		.has_oversampling = true,
+	},
+	.def_cfg = {
+		.ucon		= APPLE_S5L_UCON_DEFAULT,
+		.ufcon		= S3C2410_UFCON_DEFAULT,
+	},
+};
 #define S5L_SERIAL_DRV_DATA (&s5l_serial_drv_data)
+#define S5L8720_SERIAL_DRV_DATA (&s5l8720_serial_drv_data)
 #else
 #define S5L_SERIAL_DRV_DATA NULL
+#define S5L8720_SERIAL_DRV_DATA NULL
 #endif
 
 #if defined(CONFIG_ARCH_ARTPEC)
@@ -2651,6 +3023,8 @@ static const struct of_device_id s3c24xx_uart_dt_match[] = {
 		.data = EXYNOS5433_SERIAL_DRV_DATA },
 	{ .compatible = "apple,s5l-uart",
 		.data = S5L_SERIAL_DRV_DATA },
+	{ .compatible = "apple,s5l8720-uart",
+		.data = S5L8720_SERIAL_DRV_DATA },
 	{ .compatible = "samsung,exynos850-uart",
 		.data = EXYNOS850_SERIAL_DRV_DATA },
 	{ .compatible = "axis,artpec8-uart",

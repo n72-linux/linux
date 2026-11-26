@@ -7,6 +7,8 @@
 #include <linux/dev_printk.h>
 #include <linux/i2c.h>
 #include <linux/io.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/of.h>
@@ -69,6 +71,25 @@ struct s5l8702_i2c_dev {
 	void __iomem *regs;
 	int irq;
 	bool write_busy_poll;
+	bool reinit;		/* suspended: program the controller before every transfer */
+	/*
+	 * The controller's clock gates (S5L8720: "clocks"), on only while a
+	 * transfer runs, as iOS does: a clocked idle block costs power. A
+	 * gated block must not be read (the bus hangs), so the interrupt
+	 * handler only looks at the registers while clk_on is set.
+	 *
+	 * The interrupt line is level: a status bit still latched when the
+	 * gate closes keeps it asserted, and only a clocked write clears it.
+	 * So the gate is closed only after the status is cleared, and an
+	 * interrupt taken while gated is acked with the clock on briefly. An
+	 * "unhandled" return there would let the kernel disable the line, and
+	 * every PMU transfer after that would time out (s2idle freeze).
+	 */
+	struct clk_bulk_data *clks;
+	int nclks;
+	bool clk_on;
+	bool busy;		/* a transfer owns the state machine */
+	bool s5l8720;
 	enum s5l8702_i2c_state state;
 	struct i2c_msg	*msg;
 	unsigned int msg_pos;
@@ -99,6 +120,7 @@ static void s5l8702_i2c_writel(struct s5l8702_i2c_dev *i2c_dev, u32 reg, u32 val
 static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
 	uint32_t stat;
 
+again:
 	switch ( i2c_dev->state )
 	{
 
@@ -111,11 +133,22 @@ static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
 		}
 		i2c_dev->iiccon &= ~S5L8702_I2C_CON_BUSHOLD;
 		i2c_dev->iiccon |= S5L8702_I2C_CON_ACKGEN;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_8bit_addr_from_msg(i2c_dev->msg));
-		stat |= S5L8702_I2C_STAT_BB;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
+		if (i2c_dev->s5l8720) {
+			/*
+			 * The S5L8720 only generates START when mode and START
+			 * are written together, after the address.
+			 */
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_8bit_addr_from_msg(i2c_dev->msg));
+			stat |= S5L8702_I2C_STAT_BB;
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
+		} else {
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_8bit_addr_from_msg(i2c_dev->msg));
+			stat |= S5L8702_I2C_STAT_BB;
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
+		}
 		if (i2c_dev->msg->flags & I2C_M_RD) {
 		  	i2c_dev->state = STATE_PREPARE_READ;
 		}
@@ -162,8 +195,30 @@ static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
 
 	  case STATE_STOP: // Generate Stop
 generate_stop:
+		/*
+		 * S5L8720: between messages to the same device use a repeated
+		 * START. A STOP followed straight away by a new START can be
+		 * dropped by the controller, which then clocks the next
+		 * address byte out as data (overwriting the selected reg).
+		 */
+		if (i2c_dev->s5l8720 && !i2c_dev->msg_ret && i2c_dev->nmsgs > 1 &&
+		    i2c_dev->msg[1].addr == i2c_dev->msg[0].addr) {
+			i2c_dev->pending_irq = S5L8702_I2C_INT_STOP;
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT,
+					   S5L8702_I2C_STAT_MASTER | S5L8702_I2C_STAT_BB);
+			i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
+			i2c_dev->nmsgs--;
+			i2c_dev->msg++;
+			i2c_dev->msg_pos = 0;
+			i2c_dev->state = STATE_START;
+			break;
+		}
+
 		i2c_dev->pending_irq = S5L8702_I2C_INT_STOP;
 
+		/* stat is only set by STATE_START; read the current value. */
+		stat = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_STAT);
 		if (i2c_dev->msg->flags & I2C_M_RD) {
 			stat &= ~S5L8702_I2C_STAT_BB;
 		}
@@ -184,6 +239,21 @@ generate_stop:
 		} else {
 			i2c_dev->state = STATE_START;
 		}
+		/*
+		 * The S5L8720 raises no STOP interrupt. Give the STOP condition
+		 * well over a bit time to finish before anything else: the bus
+		 * runs at a few tens of kHz, and a START requested while STOP is
+		 * still on the wire is dropped, so the next address byte goes
+		 * out as data (a write to the selected register).
+		 */
+		if (i2c_dev->s5l8720) {
+			i2c_dev->pending_irq = 0;
+			if (irqs_disabled())
+				udelay(500);
+			else
+				usleep_range(500, 600);
+			goto again;
+		}
 		break;
 		
 	  case STATE_IDLE: // We are done
@@ -198,8 +268,21 @@ static irqreturn_t s5l8702_i2c_isr(int this_irq, void *data)
 	struct s5l8702_i2c_dev *i2c_dev = data;
 	u32 val;
 
+	if (!READ_ONCE(i2c_dev->clk_on)) {
+		/* latched before the gate closed: clear it with the clock on */
+		if (clk_bulk_enable(i2c_dev->nclks, i2c_dev->clks))
+			return IRQ_NONE;
+		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_INT, S5L8702_I2C_INT_ALL);
+		clk_bulk_disable(i2c_dev->nclks, i2c_dev->clks);
+		return IRQ_HANDLED;
+	}
+
 	val = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_INT);
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_INT, val);
+
+	/* stray status outside a transfer: acked, nothing to advance */
+	if (!READ_ONCE(i2c_dev->busy))
+		return IRQ_HANDLED;
 
 	dev_dbg(i2c_dev->dev, "%s state=0x%04x msg_ret=0x%04x pending_irq=0x%04x val=0x%04x",
 		__func__, i2c_dev->state, i2c_dev->msg_ret, i2c_dev->pending_irq, val);
@@ -214,13 +297,24 @@ static irqreturn_t s5l8702_i2c_isr(int this_irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
-				int num)
+static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev);
+
+static int s5l8702_i2c_do_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
+				int num, bool poll)
 {
 	unsigned long time_left;
 	struct s5l8702_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
 
 	dev_dbg(i2c_dev->dev, "%s start", __func__);
+
+	/*
+	 * Back in its reset state (CON has no clock select) after a suspend
+	 * that cut the SoC's power, and before resume_noirq has run: the n72
+	 * sleep code talks to the PMU that early. Program it again first.
+	 */
+	if (i2c_dev->reinit ||
+	    !(s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_CON) & S5L8702_I2C_CON_CKSEL512))
+		s5l8702_i2c_init(i2c_dev);
 
 	// [TODO] implement clocks this is equivalent to set controller active and clear interrupts
 	// but we are missing clock enable and disable
@@ -240,16 +334,106 @@ static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	i2c_dev->msg_pos = 0;
 	i2c_dev->state   = STATE_START;
 
+	reinit_completion(&i2c_dev->msg_complete);
+	WRITE_ONCE(i2c_dev->busy, true);
 	s5l8702_i2c_state_machine(i2c_dev);
 
-	time_left = wait_for_completion_timeout(&i2c_dev->msg_complete,
-						S5L8702_I2C_XFER_TIMEOUT);
+	if (poll || i2c_dev->irq < 0 || irqs_disabled()) {
+		/*
+		 * No interrupt wired up, or interrupts off (atomic transfers at
+		 * power-off, the n72 sleep code on the way down and just after
+		 * the wake): poll the interrupt status register and run the
+		 * handler from here.
+		 * Count iterations rather than jiffies, which do not advance
+		 * with interrupts off.
+		 */
+		unsigned int loops = 100000 / 5;	/* about 100 ms */
 
+		time_left = 1;
+		while (!completion_done(&i2c_dev->msg_complete)) {
+			if (s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_INT) &
+			    S5L8702_I2C_INT_ALL)
+				s5l8702_i2c_isr(0, i2c_dev);
+			else
+				udelay(5);
+			if (!--loops) {
+				time_left = 0;
+				break;
+			}
+		}
+	} else {
+		time_left = wait_for_completion_timeout(&i2c_dev->msg_complete,
+							S5L8702_I2C_XFER_TIMEOUT);
+	}
+
+	WRITE_ONCE(i2c_dev->busy, false);
 	dev_dbg(i2c_dev->dev, "%s done time_left=0x%04lx msg_ret=0x%04x", __func__, time_left, i2c_dev->msg_ret);
-	if (time_left == 0)
+	if (time_left == 0) {
+		if (!poll && i2c_dev->irq >= 0 && !irqs_disabled())
+			synchronize_irq(i2c_dev->irq);
+		dev_warn_ratelimited(i2c_dev->dev,
+			"timeout: addr 0x%02x state %d pending 0x%x msg %u/%d pos %u, CON 0x%x STAT 0x%x INT 0x%x UNK14 0x%x%s\n",
+			msgs[0].addr, i2c_dev->state, i2c_dev->pending_irq,
+			num - i2c_dev->nmsgs, num, i2c_dev->msg_pos,
+			s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_CON),
+			s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_STAT),
+			s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_INT),
+			s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_UNK14),
+			poll ? " (polled)" : "");
+		/* leave the controller idle and programmed for the next one */
+		s5l8702_i2c_init(i2c_dev);
 		return -ETIMEDOUT;
+	}
 
 	return i2c_dev->msg_ret ? : num;
+}
+
+/* clk_enable() only takes a spinlock: fine in the atomic (power-off) path */
+static int s5l8702_i2c_clk_on(struct s5l8702_i2c_dev *i2c_dev)
+{
+	int ret = clk_bulk_enable(i2c_dev->nclks, i2c_dev->clks);
+
+	if (!ret)
+		WRITE_ONCE(i2c_dev->clk_on, true);
+	return ret;
+}
+
+static void s5l8702_i2c_clk_off(struct s5l8702_i2c_dev *i2c_dev)
+{
+	unsigned long flags;
+
+	/* clear the level line while clocked, then gate (see clk_on) */
+	local_irq_save(flags);
+	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_INT, S5L8702_I2C_INT_ALL);
+	WRITE_ONCE(i2c_dev->clk_on, false);
+	clk_bulk_disable(i2c_dev->nclks, i2c_dev->clks);
+	local_irq_restore(flags);
+}
+
+static int s5l8702_i2c_gated_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
+				  int num, bool poll)
+{
+	struct s5l8702_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
+	int ret = s5l8702_i2c_clk_on(i2c_dev);
+
+	if (ret)
+		return ret;
+	ret = s5l8702_i2c_do_xfer(adap, msgs, num, poll);
+	s5l8702_i2c_clk_off(i2c_dev);
+	return ret;
+}
+
+static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
+			    int num)
+{
+	return s5l8702_i2c_gated_xfer(adap, msgs, num, false);
+}
+
+/* Used for PMIC writes at power-off, with interrupts disabled. */
+static int s5l8702_i2c_xfer_atomic(struct i2c_adapter *adap,
+				   struct i2c_msg msgs[], int num)
+{
+	return s5l8702_i2c_gated_xfer(adap, msgs, num, true);
 }
 
 static u32 s5l8702_i2c_func(struct i2c_adapter *adap)
@@ -263,10 +447,14 @@ static u32 s5l8702_i2c_func(struct i2c_adapter *adap)
 
 static const struct i2c_algorithm s5l8702_i2c_algo = {
 	.xfer = s5l8702_i2c_xfer,
+	.xfer_atomic = s5l8702_i2c_xfer_atomic,
 	.functionality = s5l8702_i2c_func,
 };
 
 static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
+	/* Clock prescaler (CON[3:0]) for the 512 divider: S5L8720 needs >= 1. */
+	u32 pre = i2c_dev->s5l8720 ? 1 : 0;
+
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_ADD, 0x40); // [TODO] Get slave address from DT
 
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK14, 1);
@@ -279,14 +467,24 @@ static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
 	// [TODO] calculate divisors from freq in DT
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON,
 		S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_ACKGEN |
-		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(0));
+		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(pre));
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, S5L8702_I2C_STAT_SOE); 
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK28, 0);
 
 	i2c_dev->iiccon = S5L8702_I2C_CON_INTEN_STOP | S5L8702_I2C_CON_INTEN_BUSHOLD |
-		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(0);
+		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(pre);
+	/* Keep every status interrupt source enabled on the S5L8720. */
+	if (i2c_dev->s5l8720)
+		i2c_dev->iiccon |= S5L8702_I2C_CON_INTEN_ALL;
 
 	return 0;
+}
+
+static void s5l8702_i2c_unprepare(void *data)
+{
+	struct s5l8702_i2c_dev *i2c_dev = data;
+
+	clk_bulk_unprepare(i2c_dev->nclks, i2c_dev->clks);
 }
 
 static int s5l8702_i2c_probe(struct platform_device *pdev)
@@ -306,29 +504,58 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 	if (IS_ERR(i2c_dev->regs))
 		return PTR_ERR(i2c_dev->regs);
 
+	i2c_dev->s5l8720 = of_device_is_compatible(pdev->dev.of_node,
+						   "apple,s5l8720-i2c");
 	i2c_dev->write_busy_poll = of_property_read_bool(pdev->dev.of_node,
 							  "samsung,write-busy-poll");
 
+	i2c_dev->nclks = devm_clk_bulk_get_all(&pdev->dev, &i2c_dev->clks);
+	if (i2c_dev->nclks < 0)
+		return dev_err_probe(&pdev->dev, i2c_dev->nclks, "clocks\n");
+	ret = clk_bulk_prepare(i2c_dev->nclks, i2c_dev->clks);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(&pdev->dev, s5l8702_i2c_unprepare, i2c_dev);
+	if (ret)
+		return ret;
+
+	ret = s5l8702_i2c_clk_on(i2c_dev);
+	if (ret)
+		return ret;
 	ret = s5l8702_i2c_init(i2c_dev);
+	s5l8702_i2c_clk_off(i2c_dev);
 	if (ret) {
 		dev_err(&pdev->dev, "Could initialize I2C controller\n");
 		goto err;
 	}
 
-	i2c_dev->irq = platform_get_irq(pdev, 0);
-	if (i2c_dev->irq < 0) {
+	init_completion(&i2c_dev->msg_complete);
+
+	/* Without an "interrupts" property the controller is polled. */
+	i2c_dev->irq = platform_get_irq_optional(pdev, 0);
+	if (i2c_dev->irq == -EPROBE_DEFER) {
 		ret = i2c_dev->irq;
 		goto err;
 	}
-
-	ret = devm_request_irq(&pdev->dev, i2c_dev->irq, s5l8702_i2c_isr, IRQF_SHARED,
-			  dev_name(&pdev->dev), i2c_dev);
-	if (ret) {
-		dev_err(&pdev->dev, "Could not request IRQ\n");
-		goto err;
+	if (i2c_dev->irq >= 0) {
+		/*
+		 * Kept enabled through the noirq phases: the bus carries the
+		 * PMU, which late users still reach there (the RTC core arms
+		 * the next alarm from a work item that suspend does not freeze).
+		 * With the line disabled under a running transfer, that
+		 * transfer timed out and the wake alarm was lost.
+		 */
+		ret = devm_request_threaded_irq(&pdev->dev, i2c_dev->irq, NULL,
+						s5l8702_i2c_isr,
+						IRQF_ONESHOT | IRQF_NO_SUSPEND,
+						dev_name(&pdev->dev), i2c_dev);
+		if (ret) {
+			dev_err(&pdev->dev, "Could not request IRQ\n");
+			goto err;
+		}
+	} else {
+		dev_info(&pdev->dev, "no interrupt, polling\n");
 	}
-
-	init_completion(&i2c_dev->msg_complete);
 
 	adap = &i2c_dev->adapter;
 	i2c_set_adapdata(adap, i2c_dev);
@@ -350,9 +577,48 @@ err:
 	return ret;
 }
 
+/*
+ * After a suspend that cut the SoC's power (n72 suspend to RAM) the
+ * controller is back in its reset state: program it again. Harmless
+ * otherwise, and early (noirq), before any client resumes.
+ */
+static int s5l8702_i2c_resume_noirq(struct device *dev)
+{
+	struct s5l8702_i2c_dev *i2c_dev = dev_get_drvdata(dev);
+
+	int ret;
+
+	i2c_dev->reinit = false;
+	ret = s5l8702_i2c_clk_on(i2c_dev);
+	if (ret)
+		return ret;
+	ret = s5l8702_i2c_init(i2c_dev);
+	s5l8702_i2c_clk_off(i2c_dev);
+	return ret;
+}
+
+/*
+ * The boot loader may use the controller on the way back (LLB talks to the
+ * PMU) and leave it set up its own way. Until resume_noirq, every transfer
+ * programs it again first: the n72 sleep code writes the PMU before then,
+ * both on the way down and just after the wake.
+ */
+static int s5l8702_i2c_suspend_noirq(struct device *dev)
+{
+	struct s5l8702_i2c_dev *i2c_dev = dev_get_drvdata(dev);
+
+	i2c_dev->reinit = true;
+	return 0;
+}
+
+static const struct dev_pm_ops s5l8702_i2c_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(s5l8702_i2c_suspend_noirq, s5l8702_i2c_resume_noirq)
+};
+
 #ifdef CONFIG_OF
 static const struct of_device_id s5l8702_i2c_of_match[] = {
 	{ .compatible = "samsung,s5l8702-i2c" },
+	{ .compatible = "apple,s5l8720-i2c" },
 	{},
 };
 MODULE_DEVICE_TABLE(of, s5l8702_i2c_of_match);
@@ -363,6 +629,7 @@ static struct platform_driver s5l8702_i2c_driver = {
 	.driver		= {
 		.name	= "i2c-s5l8702",
 		.of_match_table = of_match_ptr(s5l8702_i2c_of_match),
+		.pm	= pm_sleep_ptr(&s5l8702_i2c_pm_ops),
 	},
 };
 module_platform_driver(s5l8702_i2c_driver);

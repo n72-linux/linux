@@ -749,7 +749,11 @@ static u32 get_bytes_in_lli(struct pl08x_phy_chan *ch, const u32 *llis_va)
 	return bytes;
 }
 
-/* The channel should be paused when calling this */
+/*
+ * The bytes left of the active transaction; of the round being played, for
+ * a cyclic one. The channel may be running (the position of a cyclic
+ * transfer is asked for while it plays).
+ */
 static u32 pl08x_getbytes_chan(struct pl08x_dma_chan *plchan)
 {
 	struct pl08x_driver_data *pl08x = plchan->host;
@@ -758,6 +762,7 @@ static u32 pl08x_getbytes_chan(struct pl08x_dma_chan *plchan)
 	dma_addr_t llis_bus;
 	struct pl08x_txd *txd;
 	u32 llis_max_words;
+	int tries = 8;
 	size_t bytes;
 	u32 clli;
 
@@ -770,17 +775,38 @@ static u32 pl08x_getbytes_chan(struct pl08x_dma_chan *plchan)
 	/*
 	 * Follow the LLIs to get the number of remaining
 	 * bytes in the currently active transaction.
+	 *
+	 * First the next-LLI pointer and the remaining bytes in the active
+	 * transfer. On a running channel both must be of the same LLI: the
+	 * pointer is read on either side of the size, and all of it again if
+	 * the hardware went on to the next LLI in between, or is loading it
+	 * (size 0, more to come). One LLI off is a period off for a sound
+	 * buffer; a position that goes back is a lap of the buffer to ALSA.
 	 */
-	clli = readl(ch->reg_lli) & ~PL080_LLI_LM_AHB2;
-
-	/* First get the remaining bytes in the active transfer */
-	bytes = get_bytes_in_phy_channel(ch);
+	do {
+		clli = readl(ch->reg_lli) & ~PL080_LLI_LM_AHB2;
+		bytes = get_bytes_in_phy_channel(ch);
+	} while ((clli != (readl(ch->reg_lli) & ~PL080_LLI_LM_AHB2) ||
+		  (clli && !bytes)) && --tries);
 
 	if (!clli)
 		return bytes;
 
 	llis_va = txd->llis_va;
 	llis_bus = txd->llis_bus;
+
+	/*
+	 * The last LLI of a cyclic transfer links back to the first: while it
+	 * runs, its own remainder is all that is left of this round. (The
+	 * walk below would start at the first LLI and add the whole buffer:
+	 * a residue larger than the buffer, which the dmaengine PCM takes
+	 * for position 0. ALSA then has the pointer a period ahead for the
+	 * whole last period of every round of the buffer, and with dmix,
+	 * which has the kernel silence what was played, that period is
+	 * silenced before it is played.)
+	 */
+	if (txd->cyclic && clli == llis_bus)
+		return bytes;
 
 	llis_max_words = pl08x->lli_words * MAX_NUM_TSFR_LLIS;
 	BUG_ON(clli < llis_bus || clli >= llis_bus +
@@ -3054,8 +3080,27 @@ static const struct amba_id pl08x_ids[] = {
 
 MODULE_DEVICE_TABLE(amba, pl08x_ids);
 
+/*
+ * A suspend that cuts the SoC's power (suspend to RAM on the S5L8720) brings
+ * the controller back disabled. Only the probe enabled it, so after such a
+ * sleep every channel a client programmed just sat there: on the iPod
+ * touch 2G the Bluetooth UART's transmit DMA, and with it HCI. Enable it
+ * again before any client resumes.
+ */
+static int pl08x_resume_noirq(struct device *dev)
+{
+	if (!pm_runtime_status_suspended(dev))
+		pl08x_ensure_on(dev_get_drvdata(dev));
+	return 0;
+}
+
+static const struct dev_pm_ops pl08x_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, pl08x_resume_noirq)
+};
+
 static struct amba_driver pl08x_amba_driver = {
 	.drv.name	= DRIVER_NAME,
+	.drv.pm		= pm_sleep_ptr(&pl08x_pm_ops),
 	.id_table	= pl08x_ids,
 	.probe		= pl08x_probe,
 };
