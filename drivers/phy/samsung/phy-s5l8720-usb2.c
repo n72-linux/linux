@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Samsung/Apple S5L8720 USB 2.0 OTG PHY driver
+ */
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/clk.h>
@@ -79,7 +83,7 @@ static int s5l8720_usbphy_phy_power_on(struct phy *phy)
 		writel_relaxed(1, usbphy->base + S5L8720_OTGPHY_RSTCON);
 		udelay(20);
 		writel_relaxed(0, usbphy->base + S5L8720_OTGPHY_RSTCON);
-		msleep(10);		/* iBoot waits 1 ms */
+		usleep_range(10000, 11000);	/* iBoot waits 1 ms */
 		usbphy->powered = true;
 	}
 	mutex_unlock(&usbphy->lock);
@@ -232,3 +236,6 @@ static struct platform_driver s5l8720_usbphy_driver = {
 	}
 };
 module_platform_driver(s5l8720_usbphy_driver);
+
+MODULE_DESCRIPTION("Samsung/Apple S5L8720 USB 2.0 OTG PHY");
+MODULE_LICENSE("GPL");
