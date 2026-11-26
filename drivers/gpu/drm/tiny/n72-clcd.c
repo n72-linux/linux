@@ -228,7 +228,7 @@ static int n72_check(struct drm_simple_display_pipe *pipe,
 		return 0;
 	/* turned, the picture is landscape: the layer turns it onto the panel */
 	if (fb->width < (turned ? N72_H : N72_W) || fb->height < (turned ? N72_W : N72_H) ||
-	    fb->pitches[0] % 4 || plane_state->src_x || plane_state->src_y)
+	    fb->pitches[0] % fb->format->cpp[0] || plane_state->src_x || plane_state->src_y)
 		return -EINVAL;
 	return 0;
 }
@@ -240,6 +240,26 @@ static int n72_check(struct drm_simple_display_pipe *pipe,
 static u32 n72_rot_code(unsigned int rotation)
 {
 	return rotation & DRM_MODE_ROTATE_90 ? 1 : rotation & DRM_MODE_ROTATE_270 ? 3 : 0;
+}
+
+static u32 n72_layer_cfg(u32 fourcc, unsigned int rotation, bool shell)
+{
+	u32 fmt;
+
+	switch (fourcc) {
+	case DRM_FORMAT_RGB565:
+		fmt = CLCD_L_CFG_RGB565;
+		shell = false;
+		break;
+	case DRM_FORMAT_ARGB4444:
+		fmt = CLCD_L_CFG_ARGB4444;
+		break;
+	default:
+		fmt = CLCD_L_CFG_XRGB8888;
+		break;
+	}
+	return CLCD_L_CFG_BASE | fmt | (shell ? CLCD_L_CFG_ALPHA : 0) |
+	       (n72_rot_code(rotation) << 22);
 }
 
 static int n72_shell_plane_check(struct drm_plane *plane,
@@ -261,7 +281,7 @@ static int n72_shell_plane_check(struct drm_plane *plane,
 	if (ret || !ps->visible || !fb)
 		return ret;
 	if ((ps->src.x1 | ps->src.y1 | ps->src.x2 | ps->src.y2) & 0xffff ||
-	    fb->pitches[0] % 4)
+	    fb->pitches[0] % fb->format->cpp[0])
 		return -EINVAL;
 	sx = ps->src.x1 >> 16;
 	sy = ps->src.y1 >> 16;
@@ -290,14 +310,16 @@ static void n72_write_fb(struct n72_layer *l, struct drm_plane_state *ps, bool f
 	void __iomem *blk = l->clcd->regs + CLCD_L(l->index);
 	u32 code = n72_rot_code(ps->rotation);
 	u32 cfg = readl(blk + CLCD_L_CFG);
+	u32 want_cfg = n72_layer_cfg(ps->fb->format->format, ps->rotation, l->index);
+	u32 cpp = ps->fb->format->cpp[0];
 
 	if (!l->index) {
-		if ((cfg >> 22 & 3) != code) {
-			writel((cfg & ~(3U << 22)) | code << 22, blk + CLCD_L_CFG);
+		if (cfg != want_cfg)
+			writel(want_cfg, blk + CLCD_L_CFG);
+		if ((cfg >> 22 & 3) != code)
 			writel(code ? N72_W | N72_H << 16 : N72_H | N72_W << 16,
 			       blk + CLCD_L_SIZE);
-		}
-		writel(ps->fb->pitches[0] / 4, blk + CLCD_L_LINE);
+		writel(ps->fb->pitches[0] / cpp, blk + CLCD_L_LINE);
 		writel(lower_32_bits(drm_fb_dma_get_gem_addr(ps->fb, ps, 0)),
 		       blk + CLCD_L_BASE);
 		return;
@@ -321,18 +343,18 @@ static void n72_write_fb(struct n72_layer *l, struct drm_plane_state *ps, bool f
 		}
 		addr = drm_fb_dma_get_gem_obj(ps->fb, 0)->dma_addr +
 		       ps->fb->offsets[0] + (dma_addr_t)sy * ps->fb->pitches[0] +
-		       (dma_addr_t)sx * 4;
+		       (dma_addr_t)sx * cpp;
 		size = sh | (sw << 16);
 		pos = dy | (dx << 16);
-		if ((cfg >> 22 & 3) != code)
-			writel((cfg & ~(3U << 22)) | code << 22, blk + CLCD_L_CFG);
+		if (force || cfg != want_cfg)
+			writel(want_cfg, blk + CLCD_L_CFG);
 		if (force || readl(blk + CLCD_L_SIZE) != size)
 			writel(size, blk + CLCD_L_SIZE);
 		if (force || readl(blk + CLCD_L_POS) != pos)
 			writel(pos, blk + CLCD_L_POS);
 		if (force)
 			writel(0, blk + CLCD_L_ORIGIN);
-		writel(ps->fb->pitches[0] / 4, blk + CLCD_L_LINE);
+		writel(ps->fb->pitches[0] / cpp, blk + CLCD_L_LINE);
 		writel(lower_32_bits(addr), blk + CLCD_L_BASE);
 	}
 }
@@ -354,9 +376,8 @@ static void n72_shell_set(struct n72_layer *l, struct drm_plane_state *ps)
 			l->boot_mode = mode;
 			l->mode_saved = true;
 		}
-		writel(CLCD_SHELL_CFG, blk + CLCD_L_CFG);
 		writel(0, blk + CLCD_L_1C);
-		n72_write_fb(l, ps, true);	/* (and turn + active window, if any) */
+		n72_write_fb(l, ps, true);	/* (cfg, turn + active window, if any) */
 		/*
 		 * Rebuild the full 0x10 word with layer 1's bits (preserving
 		 * bootloader bits beside layer 1 hides the layer).
@@ -516,9 +537,16 @@ static const struct drm_simple_display_pipe_funcs n72_pipe_funcs = {
 	.disable_vblank = n72_disable_vblank,
 };
 
-static const u32 n72_formats[] = { DRM_FORMAT_XRGB8888 };
+static const u32 n72_formats[] = {
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_RGB565,
+	DRM_FORMAT_ARGB4444,
+};
 /* blended with its alpha: nothing without one */
-static const u32 n72_shell_formats[] = { DRM_FORMAT_ARGB8888 };
+static const u32 n72_shell_formats[] = {
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_ARGB4444,
+};
 
 /* ------------------------------------------------------ the connectors */
 
@@ -668,7 +696,9 @@ static struct n72_layer *n72_layer_create(struct n72_clcd *p, unsigned int index
 	if (ret)
 		return ERR_PTR(ret);
 	ret = drm_simple_display_pipe_init(drm, &l->pipe, &n72_pipe_funcs,
-					   index ? n72_shell_formats : n72_formats, 1,
+					   index ? n72_shell_formats : n72_formats,
+					   index ? ARRAY_SIZE(n72_shell_formats) :
+						   ARRAY_SIZE(n72_formats),
 					   NULL, &l->conn);
 	if (ret)
 		return ERR_PTR(ret);

@@ -86,13 +86,24 @@ void n72_v_write(struct n72_layer *l, struct drm_plane_state *ps)
 	dma_addr_t c = drm_fb_dma_get_gem_obj(fb, 1)->dma_addr + fb->offsets[1] +
 		       (sy & ~15) / 2 * pitch + (sx & ~15);
 	bool turned = ps->rotation & (DRM_MODE_ROTATE_90 | DRM_MODE_ROTATE_270);
+	bool bt709 = ps->color_encoding == DRM_COLOR_YCBCR_BT709;
+	bool full = ps->color_range == DRM_COLOR_YCBCR_FULL_RANGE;
 	/* turned, the source's height runs across the panel, its width down */
 	u32 qh = div_u64((u64)(turned ? ps->src.y2 - ps->src.y1 : ps->src.x2 - ps->src.x1), dw);
 	u32 qv = div_u64((u64)(turned ? ps->src.x2 - ps->src.x1 : ps->src.y2 - ps->src.y1), dh);
 	int t[4], i;
-	static const u32 bt601[9] = {	/* video range */
-		0x4a8, 0, 0x662, 0x4a8, 0x1191, 0x1340, 0x4a8, 0x812, 0,
+	static const u32 csc[2][2][9] = {
+		{	/* BT.601: limited ('420v'), full ('420f') */
+			{ 0x4a8, 0, 0x662, 0x4a8, 0x1191, 0x1340, 0x4a8, 0x812, 0 },
+			{ 0x400, 0, 0x596, 0x400, 0x115f, 0x12d8, 0x400, 0x70f, 0 },
+		},
+		{	/* BT.709: limited ('420v'), full ('420f') */
+			{ 0x4a8, 0, 0x72c, 0x4a8, 0x10da, 0x1222, 0x4a8, 0x873, 0 },
+			{ 0x400, 0, 0x631, 0x400, 0x10c0, 0x11df, 0x400, 0x76c, 0 },
+		},
 	};
+	const u32 *m = csc[bt709][full];
+	u32 en;
 
 	writel(!turned ? 0 : ps->rotation & DRM_MODE_ROTATE_90 ? CLCD_V_ROT90 : CLCD_V_ROT270,
 	       r + CLCD_V_CONFIG);
@@ -107,7 +118,7 @@ void n72_v_write(struct n72_layer *l, struct drm_plane_state *ps)
 	writel(dy | dx << 16, r + CLCD_V_POS);
 	writel(dh | dw << 16, r + CLCD_V_SIZE);
 	for (i = 0; i < 9; i++)
-		writel(bt601[i], r + CLCD_V_MATRIX + 4 * i);
+		writel(m[i], r + CLCD_V_MATRIX + 4 * i);
 	writel(qh, r + CLCD_V_RATIO_H);
 	writel(qv, r + CLCD_V_RATIO_V);
 	n72_v_pick(qh, true, &t[0], &t[1]);
@@ -124,9 +135,12 @@ void n72_v_write(struct n72_layer *l, struct drm_plane_state *ps)
 	}
 	if (!p->video_on) {
 		writel(readl(r + CLCD_LAYER_MODE) | CLCD_V_MODE, r + CLCD_LAYER_MODE);
-		writel(readl(r + CLCD_LAYER_EN) | CLCD_V_EN, r + CLCD_LAYER_EN);
 		p->video_on = true;
 	}
+	en = (readl(r + CLCD_LAYER_EN) & ~CLCD_V_LIMITED) | CLCD_V_EN;
+	if (!full)
+		en |= CLCD_V_LIMITED;
+	writel(en, r + CLCD_LAYER_EN);
 }
 
 /* reg_lock held, registers reachable */
@@ -134,7 +148,8 @@ void n72_v_off(struct n72_clcd *p)
 {
 	if (!p->video_on)
 		return;
-	writel(readl(p->regs + CLCD_LAYER_EN) & ~CLCD_V_EN, p->regs + CLCD_LAYER_EN);
+	writel(readl(p->regs + CLCD_LAYER_EN) & ~(CLCD_V_EN | CLCD_V_LIMITED),
+	       p->regs + CLCD_LAYER_EN);
 	writel(readl(p->regs + CLCD_LAYER_MODE) & ~CLCD_V_MODE, p->regs + CLCD_LAYER_MODE);
 	p->video_on = false;
 }
@@ -213,7 +228,16 @@ int n72_v_plane_init(struct n72_layer *l)
 	 * Hardware rotates the picture on readback via CONFIG codes 1/3,
 	 * keeping panel size and scale ratios landscape-oriented.
 	 */
-	return drm_plane_create_rotation_property(&l->video, DRM_MODE_ROTATE_0,
-						  DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_90 |
-						  DRM_MODE_ROTATE_270);
+	ret = drm_plane_create_rotation_property(&l->video, DRM_MODE_ROTATE_0,
+						 DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_90 |
+						 DRM_MODE_ROTATE_270);
+	if (ret)
+		return ret;
+	return drm_plane_create_color_properties(&l->video,
+						 BIT(DRM_COLOR_YCBCR_BT601) |
+						 BIT(DRM_COLOR_YCBCR_BT709),
+						 BIT(DRM_COLOR_YCBCR_LIMITED_RANGE) |
+						 BIT(DRM_COLOR_YCBCR_FULL_RANGE),
+						 DRM_COLOR_YCBCR_BT601,
+						 DRM_COLOR_YCBCR_LIMITED_RANGE);
 }

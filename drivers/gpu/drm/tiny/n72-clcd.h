@@ -32,7 +32,8 @@
 #define  CLCD_L_POS	0x14
 #define  CLCD_L_1C	0x1c
 /* the video layer (layer 2) */
-#define CLCD_V_EN	(BIT(3) | BIT(8))	/* in 0x004 */
+#define CLCD_V_EN	BIT(3)			/* in 0x004: video layer enable */
+#define CLCD_V_LIMITED	BIT(8)			/* in 0x004: limited ('420v') range */
 #define CLCD_V_MODE	0x002			/* in 0x010 */
 #define CLCD_V_CONFIG	0x118			/* the turn: 1 = 90 (counter-clockwise), 3 = 270 */
 #define  CLCD_V_ROT90	1
@@ -63,8 +64,13 @@
 #define N72_H		480
 #define N72_FRAME_NS	16666667
 #define N72_LAYERS	2
-#define CLCD_SHELL_CFG	(0x200700 | 0x110000)
-#define CLCD_SHELL_MODE	0x300
+#define CLCD_L_CFG_BASE		0x200000
+#define CLCD_L_CFG_ALPHA	0x110000	/* layer 1 premultiplied alpha */
+#define CLCD_L_CFG_RGB565	0x400
+#define CLCD_L_CFG_ARGB4444	0x600
+#define CLCD_L_CFG_XRGB8888	0x700
+#define CLCD_SHELL_CFG		(CLCD_L_CFG_BASE | CLCD_L_CFG_XRGB8888 | CLCD_L_CFG_ALPHA)
+#define CLCD_SHELL_MODE		0x300
 
 #define n72_trace(p, what, ...)							\
 	dev_dbg((p)->dev, "vbl: " what " (users %u%s%s)\n",			\
