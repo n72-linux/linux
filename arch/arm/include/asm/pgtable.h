@@ -65,9 +65,14 @@ extern void __pgd_error(const char *file, int line, pgd_t);
 /*
  * This is the lowest virtual address we can permit any user space
  * mapping to be mapped at.  This is particularly important for
- * non-high vector CPUs.
+ * non-high vector CPUs. CONFIG_ARM_LOW_USER_MAPPINGS (high vectors only,
+ * checked in devicemaps_init) lowers it to the second page.
  */
+#ifdef CONFIG_ARM_LOW_USER_MAPPINGS
+#define FIRST_USER_ADDRESS	PAGE_SIZE
+#else
 #define FIRST_USER_ADDRESS	(PAGE_SIZE * 2)
+#endif
 
 /*
  * Use TASK_SIZE as the ceiling argument for free_pgtables() and

@@ -240,6 +240,19 @@ v6_dma_inv_range:
  *	- end     - virtual end address of region
  */
 v6_dma_clean_range:
+#if defined(HARVARD_CACHE) && !defined(CONFIG_SMP)
+	/*
+	 * A range larger than any ARMv6 data cache (32 KiB at most): clean
+	 * the whole cache in one operation instead of line by line. Cleaning
+	 * more than the range is harmless, and it is far cheaper: a 64 KiB
+	 * audio buffer synced hundreds of times a second took 2048 line
+	 * operations each time. (Not on SMP, where it would only clean this
+	 * CPU's cache.)
+	 */
+	sub	r2, r1, r0
+	cmp	r2, #0x8000
+	bhs	2f
+#endif
 	bic	r0, r0, #D_CACHE_LINE_SIZE - 1
 1:
 #ifdef HARVARD_CACHE
@@ -253,6 +266,12 @@ v6_dma_clean_range:
 	mov	r0, #0
 	mcr	p15, 0, r0, c7, c10, 4		@ drain write buffer
 	ret	lr
+#if defined(HARVARD_CACHE) && !defined(CONFIG_SMP)
+2:	mov	r0, #0
+	mcr	p15, 0, r0, c7, c10, 0		@ clean entire D cache
+	mcr	p15, 0, r0, c7, c10, 4		@ drain write buffer
+	ret	lr
+#endif
 
 /*
  *	v6_dma_flush_range(start,end)

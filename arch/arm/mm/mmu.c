@@ -1425,6 +1425,8 @@ static void __init devicemaps_init(const struct machine_desc *mdesc)
 	create_mapping(&map);
 
 	if (!vectors_high()) {
+		if (IS_ENABLED(CONFIG_ARM_LOW_USER_MAPPINGS))
+			panic("CONFIG_ARM_LOW_USER_MAPPINGS needs high vectors");
 		map.virtual = 0;
 		map.length = PAGE_SIZE * 2;
 		map.type = MT_LOW_VECTORS;

@@ -780,6 +780,20 @@ config CPU_ENDIAN_BE32
 	help
 	  Support for the BE-32 (big-endian) mode on pre-ARMv6 processors.
 
+config ARM_LOW_USER_MAPPINGS
+	bool "Allow user mappings from 0x1000 (high vectors only)"
+	depends on MMU && !ARM_LPAE
+	default y if ARCH_S5L87XX
+	help
+	  Lower FIRST_USER_ADDRESS from two pages to one, so user space can
+	  map at 0x1000. The second page is only kept free for the low
+	  exception vectors; with high vectors (0xffff0000) it is unused.
+	  Old iPhone OS executables are linked at 0x1000, and the N72's
+	  native iOS app runtime maps them there. Page 0 stays unmappable.
+	  The kernel panics at boot if the vectors turn out to be low.
+
+	  If unsure, say N.
+
 config CPU_HIGH_VECTOR
 	depends on !MMU && CPU_CP15 && !CPU_ARM740T
 	bool "Select the High exception vector"

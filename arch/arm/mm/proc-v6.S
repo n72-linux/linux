@@ -139,12 +139,24 @@ SYM_TYPED_FUNC_START(cpu_v6_set_pte_ext)
 	ret	lr
 SYM_FUNC_END(cpu_v6_set_pte_ext)
 
-/* Suspend/resume support: taken from arch/arm/mach-s3c64xx/sleep.S */
+/*
+ * Suspend/resume support: taken from arch/arm/mach-s3c64xx/sleep.S
+ *
+ * With CONFIG_CURRENT_POINTER_IN_TPIDRURO the kernel keeps 'current' in
+ * TPIDRURO, and the suspending task's user TLS is in TPIDRURW: both are
+ * lost when the suspend cuts the CPU's power, so save them too (as
+ * proc-v7 does). Without this the first use of 'current' after such a
+ * resume, e.g. taking a lock, goes astray.
+ */
 .globl	cpu_v6_suspend_size
+#ifdef CONFIG_CURRENT_POINTER_IN_TPIDRURO
+.equ	cpu_v6_suspend_size, 4 * 8
+#else
 .equ	cpu_v6_suspend_size, 4 * 6
+#endif
 #ifdef CONFIG_ARM_CPU_SUSPEND
 SYM_TYPED_FUNC_START(cpu_v6_do_suspend)
-	stmfd	sp!, {r4 - r9, lr}
+	stmfd	sp!, {r4 - r11, lr}
 	mrc	p15, 0, r4, c13, c0, 0	@ FCSE/PID
 #ifdef CONFIG_MMU
 	mrc	p15, 0, r5, c3, c0, 0	@ Domain ID
@@ -153,8 +165,14 @@ SYM_TYPED_FUNC_START(cpu_v6_do_suspend)
 	mrc	p15, 0, r7, c1, c0, 1	@ auxiliary control register
 	mrc	p15, 0, r8, c1, c0, 2	@ co-processor access control
 	mrc	p15, 0, r9, c1, c0, 0	@ control register
+#ifdef CONFIG_CURRENT_POINTER_IN_TPIDRURO
+	mrc	p15, 0, r10, c13, c0, 2	@ TPIDRURW (user TLS)
+	mrc	p15, 0, r11, c13, c0, 3	@ TPIDRURO ('current')
+	stmia	r0, {r4 - r11}
+#else
 	stmia	r0, {r4 - r9}
-	ldmfd	sp!, {r4- r9, pc}
+#endif
+	ldmfd	sp!, {r4 - r11, pc}
 SYM_FUNC_END(cpu_v6_do_suspend)
 
 SYM_TYPED_FUNC_START(cpu_v6_do_resume)
@@ -164,7 +182,13 @@ SYM_TYPED_FUNC_START(cpu_v6_do_resume)
 	mcr	p15, 0, ip, c7, c15, 0	@ clean+invalidate cache
 	mcr	p15, 0, ip, c7, c10, 4	@ drain write buffer
 	mcr	p15, 0, ip, c13, c0, 1	@ set reserved context ID
+#ifdef CONFIG_CURRENT_POINTER_IN_TPIDRURO
+	ldmia	r0, {r4 - r11}
+	mcr	p15, 0, r10, c13, c0, 2	@ TPIDRURW
+	mcr	p15, 0, r11, c13, c0, 3	@ TPIDRURO
+#else
 	ldmia	r0, {r4 - r9}
+#endif
 	mcr	p15, 0, r4, c13, c0, 0	@ FCSE/PID
 #ifdef CONFIG_MMU
 	mcr	p15, 0, r5, c3, c0, 0	@ Domain ID
