@@ -15,6 +15,7 @@
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/soc/apple/s5l8720-usbphy.h>
 #include <linux/workqueue.h>
 
 /*
@@ -29,8 +30,9 @@
 #define N72_PMU_ADCCON		0x40
 #define N72_PMU_ADCCON_START	0x10
 #define N72_PMU_ADCOUT		0x41
-#define N72_PMU_ADC_VBAT	4
 #define N72_PMU_ADC_NTC		2
+#define N72_PMU_ADC_VBAT	4
+#define N72_PMU_ADC_USB_DMON	6
 
 #define N72_PMU_STATUS_USB	BIT(3)			/* byte 0 */
 #define N72_PMU_STATUS_CHARGING	(BIT(1) | BIT(2))	/* byte 1: the charger charges */
@@ -47,6 +49,7 @@ struct n72_pmu_power {
 	int vbat_mv;
 	struct notifier_block nb;
 	bool usb_irq;			/* USB plug and unplug come as events */
+	enum power_supply_usb_type usb_type;
 
 	/* the battery level, as iOS works it out (n72_gauge_*) */
 	struct delayed_work gauge_work;
@@ -572,13 +575,88 @@ static void n72_pmu_usb_release(struct n72_pmu_power *pmu)
 		dev_dbg(pmu->dev, "USB supply was held under 100 mA (0x0a = %02x): released\n", v);
 }
 
+/*
+ * Measure D- and D+ through the USB PHY analog monitor mux (DMON) and PMU ADC
+ * channel 6 (5000 mV full scale / 1024 steps) to identify Apple 500 mA / 1 A /
+ * 2 A wall bricks before dwc2 turns on D+ pull-ups.
+ */
+static int n72_pmu_detect_brick(struct n72_pmu_power *pmu, int *ilim_ua,
+				enum power_supply_usb_type *type)
+{
+	unsigned int raw_dm = 0, raw_dp = 0;
+	int dm_mv, dp_mv, ratio;
+	int ret;
+
+	*ilim_ua = 500000;
+	*type = POWER_SUPPLY_USB_TYPE_SDP;
+
+	ret = s5l8720_usbphy_set_dmonitor(S5L8720_USBPHY_DMON_DM);
+	if (ret)
+		return ret;
+	usleep_range(2000, 3000);
+	mutex_lock(&pmu->adc_lock);
+	ret = n72_pmu_adc(pmu, N72_PMU_ADC_USB_DMON, &raw_dm);
+	mutex_unlock(&pmu->adc_lock);
+
+	if (!ret) {
+		ret = s5l8720_usbphy_set_dmonitor(S5L8720_USBPHY_DMON_DP);
+		if (!ret) {
+			usleep_range(2000, 3000);
+			mutex_lock(&pmu->adc_lock);
+			ret = n72_pmu_adc(pmu, N72_PMU_ADC_USB_DMON, &raw_dp);
+			mutex_unlock(&pmu->adc_lock);
+		}
+	}
+	s5l8720_usbphy_set_dmonitor(S5L8720_USBPHY_DMON_OFF);
+	if (ret)
+		return ret;
+
+	dm_mv = (raw_dm * 5000) >> 10;
+	dp_mv = (raw_dp * 5000) >> 10;
+	if (dm_mv >= 1000 && dp_mv >= 1000) {
+		ratio = (dm_mv * 1000) / dp_mv;
+		if (ratio >= 1291 && ratio <= 1505) {
+			*ilim_ua = 1000000;
+			*type = POWER_SUPPLY_USB_TYPE_DCP;
+			dev_info(pmu->dev,
+				 "USB brick 1 A (dP=%d mV dM=%d mV): limit 1000 mA\n",
+				 dp_mv, dm_mv);
+		} else if (ratio >= 665 && ratio <= 775) {
+			/* D1759 max ILIM reg code (3) is 1000 mA */
+			*ilim_ua = 1000000;
+			*type = POWER_SUPPLY_USB_TYPE_DCP;
+			dev_info(pmu->dev,
+				 "USB brick 2 A (dP=%d mV dM=%d mV): limit 1000 mA\n",
+				 dp_mv, dm_mv);
+		} else if (ratio >= 901 && ratio <= 1120 && dm_mv <= 2340) {
+			*ilim_ua = 500000;
+			*type = POWER_SUPPLY_USB_TYPE_DCP;
+			dev_info(pmu->dev,
+				 "USB brick 500 mA (dP=%d mV dM=%d mV): limit 500 mA\n",
+				 dp_mv, dm_mv);
+		}
+	}
+	return 0;
+}
+
 static void n72_pmu_usb_plugged(struct n72_pmu_power *pmu)
 {
-	if (n72_pmu_usb_online(pmu))
+	enum power_supply_usb_type usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	int target_ua = 500000;
+	int cur_ua;
+
+	if (n72_pmu_usb_online(pmu)) {
 		n72_pmu_usb_release(pmu);
-	if (n72_pmu_usb_online(pmu) && n72_pmu_ilim_get(pmu) < 500000 &&
-	    !n72_pmu_ilim_set_locked(pmu, 500000))
-		dev_info(pmu->dev, "USB input current limit 100 -> 500 mA\n");
+		n72_pmu_detect_brick(pmu, &target_ua, &usb_type);
+		WRITE_ONCE(pmu->usb_type, usb_type);
+		cur_ua = n72_pmu_ilim_get(pmu);
+		if (cur_ua >= 0 && cur_ua != target_ua &&
+		    !n72_pmu_ilim_set_locked(pmu, target_ua))
+			dev_info(pmu->dev, "USB input current limit %d -> %d mA\n",
+				 cur_ua / 1000, target_ua / 1000);
+	} else {
+		WRITE_ONCE(pmu->usb_type, POWER_SUPPLY_USB_TYPE_UNKNOWN);
+	}
 	/* as iOS: no sample at the plug, the first paused one three minutes on */
 	mutex_lock(&pmu->chg_lock);
 	pmu->next_sample = jiffies + N72_GAUGE_EXT_PERIOD;
@@ -602,6 +680,11 @@ static int n72_pmu_usb_get(struct power_supply *psy, enum power_supply_property 
 			return ret;
 		val->intval = ret;
 		return 0;
+	case POWER_SUPPLY_PROP_USB_TYPE:
+		val->intval = n72_pmu_usb_online(pmu) ?
+			      READ_ONCE(pmu->usb_type) :
+			      POWER_SUPPLY_USB_TYPE_UNKNOWN;
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -623,6 +706,7 @@ static int n72_pmu_usb_writeable(struct power_supply *psy, enum power_supply_pro
 static const enum power_supply_property n72_pmu_usb_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+	POWER_SUPPLY_PROP_USB_TYPE,
 };
 
 static char *n72_pmu_usb_supplies[] = { "battery" };
@@ -630,6 +714,9 @@ static char *n72_pmu_usb_supplies[] = { "battery" };
 static const struct power_supply_desc n72_pmu_usb_desc = {
 	.name = "usb",
 	.type = POWER_SUPPLY_TYPE_USB,
+	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
+		     BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_DCP),
 	.properties = n72_pmu_usb_props,
 	.num_properties = ARRAY_SIZE(n72_pmu_usb_props),
 	.get_property = n72_pmu_usb_get,
@@ -644,6 +731,8 @@ static int n72_pmu_power_event(struct notifier_block *nb, unsigned long event, v
 
 	if (event == N72_PMU_EVENT_USB_IN)
 		n72_pmu_usb_plugged(pmu);
+	else if (event == N72_PMU_EVENT_USB_OUT)
+		WRITE_ONCE(pmu->usb_type, POWER_SUPPLY_USB_TYPE_UNKNOWN);
 	if (event == N72_PMU_EVENT_USB_IN || event == N72_PMU_EVENT_USB_OUT) {
 		power_supply_changed(pmu->usb);
 		/* the battery's status follows the cable */
@@ -762,7 +851,8 @@ static int n72_pmu_power_resume(struct device *dev)
 
 	if (pmu->usb_irq) {
 		n72_pmu_usb_irq(pmu->core, true);
-		/* report a cable change made while asleep */
+		/* report and classify a cable change made while asleep */
+		n72_pmu_usb_plugged(pmu);
 		power_supply_changed(pmu->usb);
 		power_supply_changed(pmu->bat);
 	}
