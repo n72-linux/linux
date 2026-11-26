@@ -430,6 +430,8 @@
 			compatible = "arm,pl080", "arm,primecell";
 			arm,primecell-periphid = <0x00041080>;
 			reg = <0x38700000 0x1000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <17>;
 			clocks = <&clkgate 0 12>;
 			clock-names = "apb_pclk";
 			#dma-cells = <2>;
@@ -822,6 +824,8 @@
 		spi1: spi@3ce00000 {
 			compatible = "apple,s5l8720-spi";
 			reg = <0x3ce00000 0x100>;
+			interrupt-parent = <&vic0>;
+			interrupts = <10>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			clock-frequency = <24000000>;
@@ -873,6 +877,9 @@
 		spi4: spi@3e100000 {
 			compatible = "apple,s5l8720-spi";
 			reg = <0x3e100000 0x100>;
+			interrupt-parent = <&vic1>;
+			interrupts = <23>;
+			apple,tx-dma = <&dmac1 3 6>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			clock-frequency = <24000000>;
