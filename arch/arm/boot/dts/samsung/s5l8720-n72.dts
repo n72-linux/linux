@@ -916,6 +916,7 @@
 		clcd: lcd@38900000 {
 			compatible = "apple,n72-lcd";
 			reg = <0x38900000 0x2000>, <0x3d800000 0x100>;
+			interrupts-extended = <&gpio 0x26 IRQ_TYPE_EDGE_RISING>;
 			reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
 			/* iOS lcd-panel-id (class 1) */
 			apple,panel-id = <0xa2d10784>;

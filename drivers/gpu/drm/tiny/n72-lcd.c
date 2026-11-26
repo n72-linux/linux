@@ -32,9 +32,11 @@
  * (include/linux/soc/apple/n72-lcd.h).
  */
 
+#include <linux/atomic.h>
 #include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
@@ -57,6 +59,7 @@
 static const u16 clcd_regs[] = {
 	0x3c, 0x5c, 0x114,
 	0x04, 0x10, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38,	/* window 0 */
+	0x64, 0x68, 0x6c,					/* background colour */
 	0x300, 0x304,
 	0x1b10, 0x1b14, 0x1b18, 0x1b1c, 0x1b20, 0x1b24,
 	/*
@@ -137,6 +140,9 @@ struct n72_lcd {
 	 */
 	bool blanked;
 	struct mutex blank_lock;	/* serialises panel_power writes */
+	int esd_irq;
+	bool esd_irq_enabled;
+	atomic_t esd_errors;
 };
 
 static BLOCKING_NOTIFIER_HEAD(n72_lcd_clients);
@@ -385,6 +391,31 @@ static void n72_lcd_shutdown(struct n72_lcd *l)
 	panel_ldo(l, false);
 }
 
+static irqreturn_t n72_lcd_esd_irq(int irq, void *data)
+{
+	struct n72_lcd *l = data;
+	int count = atomic_inc_return(&l->esd_errors);
+
+	dev_warn_ratelimited(l->dev, "panel ESD/fault interrupt (%d)\n", count);
+	return IRQ_HANDLED;
+}
+
+static void n72_lcd_esd_irq_enable(struct n72_lcd *l)
+{
+	if (l->esd_irq > 0 && !l->esd_irq_enabled) {
+		enable_irq(l->esd_irq);
+		l->esd_irq_enabled = true;
+	}
+}
+
+static void n72_lcd_esd_irq_disable(struct n72_lcd *l)
+{
+	if (l->esd_irq > 0 && l->esd_irq_enabled) {
+		disable_irq(l->esd_irq);
+		l->esd_irq_enabled = false;
+	}
+}
+
 /* ---------------------------------------------------------------- PM */
 
 /* Put the backlight's power state back as it was before the sleep. */
@@ -402,6 +433,7 @@ static int n72_lcd_suspend(struct device *dev)
 
 	if (l->blanked)			/* already down, its registers gated */
 		return 0;
+	n72_lcd_esd_irq_disable(l);
 	/*
 	 * The backlight resumes before this device and would light the panel
 	 * while it is still coming back up (a white flash): keep it off until
@@ -450,6 +482,7 @@ static int n72_lcd_resume(struct device *dev)
 	 */
 	blocking_notifier_call_chain(&n72_lcd_clients, N72_LCD_RESUMED, NULL);
 	n72_lcd_backlight_restore(l);
+	n72_lcd_esd_irq_enable(l);
 	return 0;
 }
 
@@ -522,6 +555,7 @@ static void n72_lcd_blank(struct n72_lcd *l)
 {
 	int i;
 
+	n72_lcd_esd_irq_disable(l);
 	/* every other user of the CLCD registers stops first */
 	blocking_notifier_call_chain(&n72_lcd_clients, N72_LCD_OFF, NULL);
 	if (l->bl) {
@@ -561,6 +595,7 @@ static int n72_lcd_unblank(struct n72_lcd *l)
 	 */
 	msleep(34);
 	n72_lcd_backlight_restore(l);
+	n72_lcd_esd_irq_enable(l);
 	return ret;
 }
 
@@ -591,8 +626,18 @@ static ssize_t panel_power_store(struct device *dev, struct device_attribute *at
 }
 static DEVICE_ATTR_RW(panel_power);
 
+static ssize_t esd_errors_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct n72_lcd *l = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", atomic_read(&l->esd_errors));
+}
+static DEVICE_ATTR_RO(esd_errors);
+
 static struct attribute *n72_lcd_attrs[] = {
 	&dev_attr_panel_power.attr,
+	&dev_attr_esd_errors.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(n72_lcd);
@@ -699,6 +744,20 @@ static int n72_lcd_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, n72_lcd_unregister_pm, &l->pm_nb);
 	if (ret)
 		return ret;
+
+	l->esd_irq = platform_get_irq_optional(pdev, 0);
+	if (l->esd_irq == -EPROBE_DEFER)
+		return -EPROBE_DEFER;
+	if (l->esd_irq > 0) {
+		ret = devm_request_irq(dev, l->esd_irq, n72_lcd_esd_irq, 0,
+				       "n72-lcd-esd", l);
+		if (ret)
+			dev_warn(dev, "panel ESD IRQ %d failed: %d\n",
+				 l->esd_irq, ret);
+		else
+			l->esd_irq_enabled = true;
+	}
+
 	/* bring the picture back alongside slower devices, not after them */
 	device_enable_async_suspend(dev);
 	return 0;
