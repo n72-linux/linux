@@ -150,13 +150,13 @@ static u32 z2_sum(const u8 *b, int len)
 	return s;
 }
 
-/* One full-duplex transfer of len bytes; tx is copied, rx may be NULL. */
+/* One SPI transfer of len bytes; tx is copied, rx may be NULL (TX-only for DMA). */
 static int z2_xfer(struct zephyr2 *z2, const struct z2_speed *sp,
 		   const u8 *tx, u8 *rx, int len, bool is_rx)
 {
 	struct spi_transfer t = {
 		.tx_buf = z2->tx,
-		.rx_buf = z2->rx,
+		.rx_buf = rx ? z2->rx : NULL,
 		.len = len,
 		.speed_hz = sp->hz,
 		.delay = {
@@ -621,11 +621,11 @@ static irqreturn_t z2_irq_thread(int irq, void *data)
 	unsigned long errors = z2->errors;
 
 	/*
-	 * IRQ threads are SCHED_FIFO. A frame read spins on SPI for a few
-	 * ms, and after an SPI stall the controller asks again and again
-	 * with bad frames: at real-time priority that kept user space (the
-	 * UI) off the CPU for 100-300 ms. At normal priority the scheduler
-	 * shares the CPU.
+	 * IRQ threads are SCHED_FIFO. SPI IRQ PIO avoids long CPU spins during
+	 * normal reads, but after an SPI desync the controller asks again and
+	 * again with bad frames: at real-time priority that kept user space
+	 * (the UI) off the CPU for 100-300 ms. At normal priority the
+	 * scheduler shares the CPU.
 	 */
 	if (unlikely(current->policy != SCHED_NORMAL))
 		sched_set_normal(current, -5);
