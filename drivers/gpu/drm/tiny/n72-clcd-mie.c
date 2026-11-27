@@ -206,11 +206,11 @@ static void n72_mie_hw_init_locked(struct n72_clcd *p)
 	void __iomem *r = p->regs;
 	int i;
 
-	/* ROI { x_max=319, y_max=479, x_min=0, y_min=0 } */
-	writel((479U << 16) | 319U, r + CLCD_MIE_ROI0);
-	writel(0, r + CLCD_MIE_ROI0 + 4);
-	writel((479U << 16) | 319U, r + CLCD_MIE_ROI1);
-	writel(0, r + CLCD_MIE_ROI1 + 4);
+	/* ROI0/ROI1: +0 = (x_min << 16) | y_min, +4 = (x_max << 16) | y_max */
+	writel(0, r + CLCD_MIE_ROI0);
+	writel(((u32)(N72_W - 1) << 16) | (N72_H - 1), r + CLCD_MIE_ROI0 + 4);
+	writel(0, r + CLCD_MIE_ROI1);
+	writel(((u32)(N72_W - 1) << 16) | (N72_H - 1), r + CLCD_MIE_ROI1 + 4);
 
 	writel((88U << 16) | 64U, r + CLCD_MIE_CURVEX);
 	writel((105U << 16) | 56U, r + CLCD_MIE_CURVEX + 4);
@@ -314,12 +314,13 @@ static void n72_mie_sync_locked(struct n72_clcd *p, bool force_reinit)
 				n72_mie_hw_init_locked(p);
 				p->mie_hw_inited = true;
 			}
-			ctrl = (readl(p->regs + CLCD_MIE_CTRL) & ~BIT(1)) | BIT(0);
-			writel((readl(p->regs + CLCD_MIE_CFG0) & ~BIT(8)),
+			ctrl = readl(p->regs + CLCD_MIE_CTRL) & ~BIT(1);
+			writel(ctrl, p->regs + CLCD_MIE_CTRL);
+			writel(readl(p->regs + CLCD_MIE_CFG0) & ~BIT(8),
 			       p->regs + CLCD_MIE_CFG0);
 			writel((p->gamma_enabled ? CLCD_LUT_GAMMA_EN : 0) | CLCD_LUT_MIE_EN,
 			       p->regs + CLCD_LUT_EN);
-			writel(ctrl, p->regs + CLCD_MIE_CTRL);
+			writel(ctrl | BIT(0), p->regs + CLCD_MIE_CTRL);
 			p->mie_active = true;
 			p->mie_stopping = false;
 			p->mie_off_frames = 0;
