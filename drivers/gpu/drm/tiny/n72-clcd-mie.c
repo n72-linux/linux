@@ -129,15 +129,19 @@ static const u32 n72_mie_bl_thresh[255] = {
 
 static u8 n72_mie_bl_scale(u32 stat)
 {
-	int i;
+	unsigned int lo = 1, hi = ARRAY_SIZE(n72_mie_bl_thresh);
 
-	if (stat < n72_mie_bl_thresh[0])
+	if (stat < n72_mie_bl_thresh[1])
 		return 255;
-	for (i = 0; i < ARRAY_SIZE(n72_mie_bl_thresh) - 1; i++) {
-		if (stat < n72_mie_bl_thresh[i + 1])
-			return 255 - i;
+	while (lo < hi) {
+		unsigned int mid = lo + ((hi - lo) >> 1);
+
+		if (stat < n72_mie_bl_thresh[mid])
+			hi = mid;
+		else
+			lo = mid + 1;
 	}
-	return 1;
+	return lo == ARRAY_SIZE(n72_mie_bl_thresh) ? 1 : 256 - lo;
 }
 
 static void n72_lut_write_bank(void __iomem *regs, u32 idx_base, u32 bank,
@@ -146,9 +150,9 @@ static void n72_lut_write_bank(void __iomem *regs, u32 idx_base, u32 bank,
 	unsigned int i;
 
 	for (i = 0; i < n; i++) {
-		writel(idx_base | CLCD_LUT_WRITE | bank | i,
-		       regs + CLCD_LUT_IDX);
-		writel(vals[i] & 0xfffff, regs + CLCD_LUT_WDATA);
+		writel_relaxed(idx_base | CLCD_LUT_WRITE | bank | i,
+			       regs + CLCD_LUT_IDX);
+		writel_relaxed(vals[i] & 0xfffff, regs + CLCD_LUT_WDATA);
 	}
 }
 
@@ -424,8 +428,12 @@ static void n72_lut_restore_work(struct work_struct *work)
 
 void n72_clcd_restore_color(struct n72_clcd *p)
 {
+	bool want_mie;
+
 	mutex_lock(&p->lut_lock);
-	if (p->gamma_enabled)
+	want_mie = p->mie_mode == 2 ||
+		   (p->mie_mode == 1 && READ_ONCE(p->video_on));
+	if (p->gamma_enabled && !want_mie)
 		n72_clcd_write_lut_banks(p, true, false);
 	p->mie_hw_inited = false;
 	n72_mie_sync_locked(p, true);
