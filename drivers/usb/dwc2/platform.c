@@ -517,9 +517,29 @@ static void dwc2_driver_remove(struct platform_device *dev)
 static void dwc2_driver_shutdown(struct platform_device *dev)
 {
 	struct dwc2_hsotg *hsotg = platform_get_drvdata(dev);
+	bool dev_mode;
+
+	if (hsotg->vbus_psy_name) {
+		power_supply_unreg_notifier(&hsotg->vbus_nb);
+		cancel_work_sync(&hsotg->vbus_work);
+		mutex_lock(&hsotg->vbus_lock);
+		hsotg->vbus_frozen = true;
+		if (hsotg->vbus_off) {
+			mutex_unlock(&hsotg->vbus_lock);
+			return;
+		}
+		mutex_unlock(&hsotg->vbus_lock);
+	}
+
+	dev_mode = dwc2_is_device_mode(hsotg);
+	if (dev_mode)
+		dwc2_hsotg_vbus_off(hsotg);
 
 	dwc2_disable_global_interrupts(hsotg);
 	synchronize_irq(hsotg->irq);
+
+	if (dev_mode && hsotg->ll_hw_enabled)
+		dwc2_lowlevel_hw_disable(hsotg);
 }
 
 /**
