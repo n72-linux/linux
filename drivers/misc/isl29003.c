@@ -61,6 +61,7 @@ struct isl29003_data {
 	u32 rext_ohm;
 	u32 lux_scale;
 	u32 lux_offset;
+	u32 cal_k;
 	u32 ratio_limits[3];
 	u32 slopes[3];
 	u32 intercepts[3];
@@ -158,7 +159,7 @@ static int isl29003_set_mode(struct i2c_client *client, int mode)
 /* Calibrated N72 D1/D2 3-curve lux calculation matching AppleISL29003 */
 static int isl29003_calc_calibrated_lux(struct isl29003_data *data, u16 d1, u16 d2)
 {
-	u32 ratio, k, slope, intercept, lux;
+	u32 ratio, slope, intercept, lux;
 	int idx;
 
 	if (d1 > 0xffe || d2 > 0xffe)
@@ -178,8 +179,8 @@ static int isl29003_calc_calibrated_lux(struct isl29003_data *data, u16 d1, u16 
 
 	slope = data->slopes[idx];
 	intercept = data->intercepts[idx];
-	k = ((97300000U / data->rext_ohm) * data->lux_scale) >> 12;
-	lux = (u32)(((u64)k * ((u64)intercept * d1 + (u64)slope * d2) + 8192) >> 14);
+	lux = (u32)(((u64)data->cal_k *
+		     ((u64)intercept * d1 + (u64)slope * d2) + 8192) >> 14);
 	return min_t(u32, lux, 5000);
 }
 
@@ -585,6 +586,7 @@ static void isl29003_parse_dt(struct isl29003_data *data)
 	if (of_property_read_u32_array(np, "apple,intercepts",
 				       data->intercepts, 3))
 		return;
+	data->cal_k = ((97300000U / data->rext_ohm) * data->lux_scale) >> 12;
 	data->calibrated = true;
 }
 
