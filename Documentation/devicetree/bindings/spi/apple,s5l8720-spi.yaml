@@ -22,12 +22,25 @@ properties:
   reg:
     maxItems: 1
 
+  interrupts:
+    maxItems: 1
+    description: Optional; enables interrupt-driven PIO for multi-word transfers.
+
   clocks:
     minItems: 1
     maxItems: 2
     description: Clocks, enabled together while the controller is in use.
 
   clock-frequency: true
+
+  apple,tx-dma:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: PL080 DMAC phandle
+          - description: DMA channel index
+          - description: DMA hardware request line
+    description: Optional PL080 TX DMA channel specification for long TX-only transfers.
 
 required:
   - compatible
@@ -44,6 +57,9 @@ examples:
     spi@3e100000 {
         compatible = "apple,s5l8720-spi";
         reg = <0x3e100000 0x100>;
+        interrupt-parent = <&vic1>;
+        interrupts = <23>;
+        apple,tx-dma = <&dmac1 3 6>;
         #address-cells = <1>;
         #size-cells = <0>;
         clock-frequency = <24000000>;

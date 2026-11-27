@@ -1,0 +1,23 @@
+What:		/sys/devices/platform/display-subsystem/bg_color
+Date:		November 2026
+KernelVersion:	6.14
+Contact:	Kailash <kailash.sudhakar@gmail.com>
+Description:
+		(RW) Background colour of the S5L8720 CLCD mixer
+		(CLCD_BG_COLOR0..2), shown where enabled layers do not cover or
+		blend. Formatted as a 24-bit hex RGB value ("0x%06x"). Writing
+		accepts integers in 0..0xffffff (base autodetected via
+		kstrtou32); invalid values return -EINVAL. Saved across panel
+		power cycles and system sleep.
+
+What:		/sys/devices/platform/display-subsystem/mie
+Date:		November 2026
+KernelVersion:	6.14
+Contact:	Kailash <kailash.sudhakar@gmail.com>
+Description:
+		(RW) Mobile Image Enhancement (MIE) adaptive contrast and
+		backlight scaling mode of the S5L8720 CLCD.
+		- 0: off
+		- 1: automatic (enabled only while the CLCD video layer is active)
+		- 2: always on
+		Invalid values return -EINVAL.

@@ -9,3 +9,11 @@ Description:
 		value (as accepted by kstrtobool, for example "0" or "1")
 		blanks or unblanks the panel; writing the current state has no
 		effect. Invalid input returns -EINVAL.
+
+What:		/sys/devices/platform/soc/38900000.lcd/esd_errors
+Date:		November 2026
+KernelVersion:	6.14
+Contact:	Kailash <kailash.sudhakar@gmail.com>
+Description:
+		(RO) Count of Pinot panel ESD/fault interrupts handled by
+		the n72-lcd driver since boot.

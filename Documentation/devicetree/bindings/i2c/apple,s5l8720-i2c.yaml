@@ -33,7 +33,8 @@ properties:
     maxItems: 2
     description: Clocks, all enabled together while a transfer runs.
 
-  clock-frequency: true
+  clock-frequency:
+    description: Bus clock frequency in Hz (up to 400000 Fast-Mode on apple,s5l8720-i2c).
 
   samsung,write-busy-poll:
     type: boolean
@@ -54,6 +55,6 @@ examples:
         #size-cells = <0>;
         reg = <0x3c900000 0x100>;
         interrupts = <22>;
-        clock-frequency = <100000>;
+        clock-frequency = <400000>;
         clocks = <&clkgate 1 6>, <&clkgate 4 12>;
     };

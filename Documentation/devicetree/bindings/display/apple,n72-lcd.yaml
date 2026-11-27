@@ -41,6 +41,10 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: Backlight device of the panel.
 
+  interrupts:
+    maxItems: 1
+    description: Optional Pinot panel ESD/fault interrupt.
+
 required:
   - compatible
   - reg
@@ -57,6 +61,7 @@ examples:
     lcd@38900000 {
         compatible = "apple,n72-lcd";
         reg = <0x38900000 0x2000>, <0x3d800000 0x100>;
+        interrupts-extended = <&gpio 0x26 IRQ_TYPE_EDGE_RISING>;
         reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
         apple,panel-id = <0xa2d10784>;
         power-supply = <&ldo4>;
