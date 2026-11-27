@@ -372,6 +372,7 @@ static int mbx_pb_init(struct apple_mbx *mbx)
 	u32 first = (mbx->pb.gpu >> PAGE_SHIFT) + 1;
 
 	mbx_pb_header(mbx->pb.hdr);
+	/* Ensure parameter buffer header writes reach RAM before PB_START. */
 	wmb();
 	mbx_arm_wait(mbx, MBX_STATUS_PB_DONE);
 	mbx_write(mbx, MBX_PB_CTRL, mbx->ctrl_gpu);

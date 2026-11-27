@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  isl29003.c - Linux kernel module for
- * 	Intersil ISL29003 ambient light sensor
+ *	Intersil ISL29003 ambient light sensor
  *
  *  See file:Documentation/misc-devices/isl29003.rst
  *
  *  Copyright (c) 2009 Daniel Mack <daniel@caiaq.de>
  *
  *  Based on code written by
- *  	Rodolfo Giometti <giometti@linux.it>
- *  	Eurotech S.p.A. <info@eurotech.it>
+ *	Rodolfo Giometti <giometti@linux.it>
+ *	Eurotech S.p.A. <info@eurotech.it>
  */
 
 #include <linux/delay.h>
@@ -364,17 +364,17 @@ static int isl29003_get_adc_value(struct i2c_client *client)
  */
 
 /* range */
-static ssize_t isl29003_show_range(struct device *dev,
-				   struct device_attribute *attr, char *buf)
+static ssize_t range_show(struct device *dev,
+			  struct device_attribute *attr, char *buf)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 
 	return sysfs_emit(buf, "%i\n", isl29003_get_range(client));
 }
 
-static ssize_t isl29003_store_range(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
+static ssize_t range_store(struct device *dev,
+			   struct device_attribute *attr,
+			   const char *buf, size_t count)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	unsigned long val;
@@ -394,23 +394,20 @@ static ssize_t isl29003_store_range(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR(range, S_IWUSR | S_IRUGO,
-		   isl29003_show_range, isl29003_store_range);
-
+static DEVICE_ATTR_RW(range);
 
 /* resolution */
-static ssize_t isl29003_show_resolution(struct device *dev,
-					struct device_attribute *attr,
-					char *buf)
+static ssize_t resolution_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 
 	return sysfs_emit(buf, "%d\n", isl29003_get_resolution(client));
 }
 
-static ssize_t isl29003_store_resolution(struct device *dev,
-					 struct device_attribute *attr,
-					 const char *buf, size_t count)
+static ssize_t resolution_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	unsigned long val;
@@ -430,20 +427,20 @@ static ssize_t isl29003_store_resolution(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR(resolution, S_IWUSR | S_IRUGO,
-		   isl29003_show_resolution, isl29003_store_resolution);
+static DEVICE_ATTR_RW(resolution);
 
 /* mode */
-static ssize_t isl29003_show_mode(struct device *dev,
-				  struct device_attribute *attr, char *buf)
+static ssize_t mode_show(struct device *dev,
+			 struct device_attribute *attr, char *buf)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 
 	return sysfs_emit(buf, "%d\n", isl29003_get_mode(client));
 }
 
-static ssize_t isl29003_store_mode(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
+static ssize_t mode_store(struct device *dev,
+			  struct device_attribute *attr,
+			  const char *buf, size_t count)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	unsigned long val;
@@ -463,23 +460,20 @@ static ssize_t isl29003_store_mode(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR(mode, S_IWUSR | S_IRUGO,
-		   isl29003_show_mode, isl29003_store_mode);
-
+static DEVICE_ATTR_RW(mode);
 
 /* power state */
-static ssize_t isl29003_show_power_state(struct device *dev,
-					 struct device_attribute *attr,
-					 char *buf)
+static ssize_t power_state_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 
 	return sysfs_emit(buf, "%d\n", isl29003_get_power_state(client));
 }
 
-static ssize_t isl29003_store_power_state(struct device *dev,
-					  struct device_attribute *attr,
-					  const char *buf, size_t count)
+static ssize_t power_state_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	unsigned long val;
@@ -496,13 +490,11 @@ static ssize_t isl29003_store_power_state(struct device *dev,
 	return ret ? ret : count;
 }
 
-static DEVICE_ATTR(power_state, S_IWUSR | S_IRUGO,
-		   isl29003_show_power_state, isl29003_store_power_state);
-
+static DEVICE_ATTR_RW(power_state);
 
 /* lux */
-static ssize_t isl29003_show_lux(struct device *dev,
-				 struct device_attribute *attr, char *buf)
+static ssize_t lux_show(struct device *dev,
+			struct device_attribute *attr, char *buf)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct isl29003_data *data = i2c_get_clientdata(client);
@@ -522,7 +514,7 @@ static ssize_t isl29003_show_lux(struct device *dev,
 	return sysfs_emit(buf, "%d\n", isl29003_get_adc_value(client));
 }
 
-static DEVICE_ATTR(lux, S_IRUGO, isl29003_show_lux, NULL);
+static DEVICE_ATTR_RO(lux);
 
 static struct attribute *isl29003_attributes[] = {
 	&dev_attr_range.attr,
@@ -542,8 +534,10 @@ static int isl29003_init_client(struct i2c_client *client)
 	struct isl29003_data *data = i2c_get_clientdata(client);
 	int i;
 
-	/* read all the registers once to fill the cache.
-	 * if one of the reads fails, we consider the init failed */
+	/*
+	 * Read all the registers once to fill the cache.
+	 * If one of the reads fails, consider the init failed.
+	 */
 	for (i = 0; i < ARRAY_SIZE(data->reg_cache); i++) {
 		int v = i2c_smbus_read_byte_data(client, i);
 

@@ -381,7 +381,7 @@ static bool z2_interface_version(struct zephyr2 *z2)
 				rx[2], z2->max_packet);
 			return true;
 		}
-		msleep(5);
+		fsleep(5000);
 	}
 	z2->max_packet = 1000;
 	return false;
@@ -653,7 +653,7 @@ static int z2_boot(struct zephyr2 *z2)
 		/* Ensure SCLK is idle-high (mode 3) before reset deasserts. */
 		z2_xfer(z2, &z2_normal, prime_tx, NULL, sizeof(prime_tx), false);
 		gpiod_set_value_cansleep(z2->reset, 0);
-		msleep(15);
+		fsleep(15000);
 		/* Consume the post-reset HBPP ready banner (0x1f01). */
 		z2_xfer(z2, &z2_normal, prime_tx, NULL, sizeof(prime_tx), false);
 		if (z2_load_firmware(z2))
@@ -672,7 +672,7 @@ static int z2_boot(struct zephyr2 *z2)
 	if (!z2_calibrate(z2))
 		return -EIO;
 	z2_send_execute(z2);
-	msleep(1);
+	fsleep(1000);
 
 	if (!z2_interface_version(z2)) {
 		dev_err(dev, "no interface version\n");

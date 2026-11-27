@@ -260,7 +260,7 @@ static int dsi_power_on(struct n72_lcd *l)
 	writel(0x1ff, d + DSIM_FIFOTHLD);
 
 	writel(0x100080, d + DSIM_ESCMODE);		/* force stop, command LP */
-	msleep(1);
+	fsleep(1000);
 	writel(0x80, d + DSIM_ESCMODE);
 	ret = poll_set(d + DSIM_STATUS, ST_STOP | N72_LANES, ST_STOP | N72_LANES);
 	if (ret)
@@ -276,7 +276,7 @@ static int dsi_power_on(struct n72_lcd *l)
 	if (ret)
 		return ret;
 	writel(0x8a, d + DSIM_ESCMODE);
-	msleep(1);
+	fsleep(1000);
 	writel(0x80, d + DSIM_ESCMODE);
 	return poll_set(d + DSIM_STATUS, ST_STOP | N72_LANES, ST_STOP | N72_LANES);
 }
@@ -290,7 +290,7 @@ static int clcd_power_on(struct n72_lcd *l)
 	int i;
 
 	writel(readl(c + CLCD_CTRL) | 0x100, c + CLCD_CTRL);
-	msleep(1);
+	fsleep(1000);
 	writel(readl(c + CLCD_CTRL) & ~0x100, c + CLCD_CTRL);
 	writel(l->ctrl, c + CLCD_CTRL);
 
@@ -351,12 +351,12 @@ static int n72_lcd_bringup(struct n72_lcd *l)
 		return ret;
 	sleep_until(t);
 	gpiod_set_value_cansleep(l->reset, 0);	/* out of reset */
-	msleep(6);
+	fsleep(6000);
 	dcs(l, 0x11);				/* sleep out, in LP */
 	/* 67 ms: half of iOS's 134, checked by eye (no white flash) */
 	t = ktime_add_ms(ktime_get(), class1 ? 67 : 100);
 	if (class1)
-		msleep(5);
+		fsleep(5000);
 	else
 		udelay(10);
 	ret = dsi_hs_clock(l, true);

@@ -78,9 +78,10 @@ config PINCTRL_S5L8720
 	select OF_GPIO
 	select IRQ_DOMAIN
 	help
-	  Pin controller, GPIO and GPIO interrupt controller driver for the
+	  Pin controller, GPIO, and GPIO interrupt controller driver for the
 	  Samsung/Apple S5L8720 SoC, as found in the iPod touch 2nd generation.
-	  Provides pinmux, pull-up/down pinconf, and IRQ support.
+	  Supports per-pin muxing via pinmux bindings, pull-up/down bias
+	  configuration, and multi-bank GPIO interrupts across suspend/resume.
 
 config PINCTRL_ARTPEC6
 	bool "Axis ARTPEC-6 pin controller driver"

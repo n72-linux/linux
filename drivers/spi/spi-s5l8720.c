@@ -2,9 +2,9 @@
 /*
  * SPI controller driver for the Samsung/Apple S5L8720
  *
- * Polled streaming transfers up to 65535 words per hardware segment using the
- * 16-word TX/RX FIFOs in 8-, 16-, or 32-bit word mode. Chip selects are GPIOs
- * (cs-gpios).
+ * Supports polled transfers, interrupt-driven PIO, and PL080 DMAC1 TX DMA
+ * up to 65535 words per hardware segment using the 16-word TX/RX FIFOs in
+ * 8-, 16-, or 32-bit word mode. Chip selects are GPIOs (cs-gpios).
  */
 
 #include <linux/bitfield.h>
