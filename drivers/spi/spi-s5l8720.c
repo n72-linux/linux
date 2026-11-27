@@ -106,6 +106,14 @@ struct s5l8720_spi {
 	struct completion dma_done;
 	bool dmac_active;
 	int dma_err;
+
+	u32 last_speed_hz;
+	unsigned int last_bytes;
+	int last_delay_ns;
+	u32 cached_div;
+	u32 cached_spidd;
+	u32 cached_timeout_us;
+	u32 cached_word_us;
 };
 
 static int s5l8720_spi_prepare_hw(struct spi_controller *ctlr)
@@ -293,7 +301,6 @@ static irqreturn_t s5l8720_spi_irq(int irq, void *data)
 	while (ss->rx_done < ss->seg) {
 		unsigned int rx_avail, in_flight, tx_space, tx_push;
 
-		st = readl(b + SPI_STATUS);
 		rx_avail = min_t(unsigned int, FIELD_GET(STATUS_RXLVL, st),
 				 ss->seg - ss->rx_done);
 		if (rx_avail) {
@@ -315,6 +322,8 @@ static irqreturn_t s5l8720_spi_irq(int irq, void *data)
 
 		if (!rx_avail && !tx_push)
 			break;
+		if (ss->rx_done < ss->seg)
+			st = readl(b + SPI_STATUS);
 	}
 
 	writel(st & STATUS_CLEAR_MASK, b + SPI_STATUS);
@@ -538,6 +547,7 @@ static int s5l8720_spi_transfer_one(struct spi_controller *ctlr,
 	const u8 *tx = xfer->tx_buf;
 	u8 *rx = xfer->rx_buf;
 	u32 setup, div, spidd, timeout_us, word_us;
+	u32 speed_hz = xfer->speed_hz ?: spi->max_speed_hz;
 	unsigned long bus_hz;
 	int delay_ns, ret = 0;
 
@@ -547,21 +557,43 @@ static int s5l8720_spi_transfer_one(struct spi_controller *ctlr,
 	if (bytes == 3)
 		bytes = 4;
 
-	div = DIV_ROUND_UP(ss->clk_rate, xfer->speed_hz ?: spi->max_speed_hz);
-	div = clamp_t(u32, div, 1, S5L8720_SPI_MAXDIV);
-	bus_hz = max_t(unsigned long, 1, ss->clk_rate / div);
-	word_us = max_t(u32, 2, DIV_ROUND_UP_ULL((u64)bytes * 16ULL * USEC_PER_SEC, bus_hz));
-	setup = s5l8720_spi_setup_bits(spi, bpw);
-	/* Progress timeout per FIFO fill: 8x FIFO bit time, at least 2 ms. */
-	timeout_us = max_t(u32, 2000,
-			   div_u64(8ULL * S5L8720_SPI_FIFO_DEPTH * bytes * 8 *
-				   USEC_PER_SEC * div, ss->clk_rate));
-
 	delay_ns = spi_delay_to_ns(&xfer->word_delay, xfer);
 	if (delay_ns <= 0)
 		delay_ns = spi_delay_to_ns(&spi->word_delay, xfer);
-	spidd = delay_ns > 0 ?
-		DIV_ROUND_UP_ULL((u64)delay_ns * 66500000ULL, NSEC_PER_SEC) : 0;
+	delay_ns = max(delay_ns, 0);
+
+	if (ss->last_bytes == bytes && ss->last_speed_hz == speed_hz &&
+	    ss->last_delay_ns == delay_ns) {
+		div = ss->cached_div;
+		spidd = ss->cached_spidd;
+		timeout_us = ss->cached_timeout_us;
+		word_us = ss->cached_word_us;
+	} else {
+		div = DIV_ROUND_UP(ss->clk_rate, speed_hz);
+		div = clamp_t(u32, div, 1, S5L8720_SPI_MAXDIV);
+		bus_hz = max_t(unsigned long, 1, ss->clk_rate / div);
+		word_us = max_t(u32, 2,
+				DIV_ROUND_UP_ULL((u64)bytes * 16ULL * USEC_PER_SEC,
+						 bus_hz));
+		/* Progress timeout per FIFO fill: 8x FIFO bit time, at least 2 ms. */
+		timeout_us = max_t(u32, 2000,
+				   div_u64(8ULL * S5L8720_SPI_FIFO_DEPTH *
+					   bytes * 8 * USEC_PER_SEC * div,
+					   ss->clk_rate));
+		spidd = delay_ns > 0 ?
+			DIV_ROUND_UP_ULL((u64)delay_ns * 66500000ULL,
+					 NSEC_PER_SEC) : 0;
+
+		ss->last_speed_hz = speed_hz;
+		ss->last_bytes = bytes;
+		ss->last_delay_ns = delay_ns;
+		ss->cached_div = div;
+		ss->cached_spidd = spidd;
+		ss->cached_timeout_us = timeout_us;
+		ss->cached_word_us = word_us;
+	}
+
+	setup = s5l8720_spi_setup_bits(spi, bpw);
 
 	writel(div, ss->base + SPI_CLKDIV);
 	writel(spidd, ss->base + SPI_SPIDD);
