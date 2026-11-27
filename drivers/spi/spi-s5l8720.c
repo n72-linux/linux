@@ -122,7 +122,7 @@ static int s5l8720_spi_unprepare_hw(struct spi_controller *ctlr)
 {
 	struct s5l8720_spi *ss = spi_controller_get_devdata(ctlr);
 
-	writel(0, ss->base + SPI_SETUP);
+	/* Keep SPI_SETUP so idle SCLK polarity (CPOL) holds between messages. */
 	writel(STATUS_CLEAR_MASK, ss->base + SPI_STATUS);
 	writel(0, ss->base + SPI_CONTROL);
 	WRITE_ONCE(ss->clk_on, false);
