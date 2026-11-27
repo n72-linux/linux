@@ -3322,6 +3322,24 @@ static void brcmf_ios_sleep_filter(struct brcmf_if *ifp, bool enable)
 	}
 }
 
+struct brcmf_ios_keepalive_le {
+	__le32 period_msec;
+	__le16 len_bytes;
+} __packed;
+
+static void brcmf_ios_keepalive(struct brcmf_if *ifp, u32 period_ms)
+{
+	struct brcmf_ios_keepalive_le ka = {
+		.period_msec = cpu_to_le32(period_ms),
+		.len_bytes = 0,
+	};
+	int err;
+
+	err = brcmf_fil_iovar_data_set(ifp, "keep_alive", &ka, sizeof(ka));
+	if (err)
+		brcmf_dbg(INFO, "keep_alive %u: %d\n", period_ms, err);
+}
+
 static void brcmf_ios_add_filter(struct brcmf_if *ifp, u32 id, u32 offset,
 				 const u8 *mask, const u8 *pattern, u32 size)
 {
@@ -4239,6 +4257,7 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 		/* the bus worker marks the bus up again a moment after the thaw */
 		for (i = 0; i < 40 && cfg->pub->bus_if->state != BRCMF_BUS_UP; i++)
 			msleep(5);
+		brcmf_ios_keepalive(ifp, 0);
 		brcmf_ios_sleep_filter(ifp, false);
 	}
 
@@ -4378,6 +4397,7 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 			return 1;
 		brcmf_ios_sleep_filter(ifp, true);
+		brcmf_ios_keepalive(ifp, 30000);
 	} else if (wowl == NULL && pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
 		   brcmf_keep_link_s2idle(ifp)) {
 		/* nothing to do: the firmware keeps the association */
