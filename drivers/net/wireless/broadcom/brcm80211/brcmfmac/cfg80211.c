@@ -5857,7 +5857,10 @@ static int brcmf_cfg80211_get_channel(struct wiphy *wiphy,
 		width = NL80211_CHAN_WIDTH_40;
 		break;
 	case BRCMU_CHAN_BW_20:
-		width = NL80211_CHAN_WIDTH_20;
+		if (wiphy->bands[band] && wiphy->bands[band]->ht_cap.ht_supported)
+			width = NL80211_CHAN_WIDTH_20;
+		else
+			width = NL80211_CHAN_WIDTH_20_NOHT;
 		break;
 	case BRCMU_CHAN_BW_80P80:
 		width = NL80211_CHAN_WIDTH_80P80;
