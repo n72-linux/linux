@@ -24,10 +24,12 @@
 #include <linux/mfd/syscon.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/pm.h>
 #include <linux/regmap.h>
+#include <linux/suspend.h>
 #include <linux/watchdog.h>
 
 #define S5L8720_WDTCON		0x0
@@ -44,20 +46,32 @@
 struct s5l8720_wdt {
 	struct watchdog_device wdd;
 	struct regmap *map;
+	struct notifier_block pm_nb;
+	struct mutex lock;
+	bool suspended;
 };
 
 static int s5l8720_wdt_ping(struct watchdog_device *wdd)
 {
 	struct s5l8720_wdt *w = watchdog_get_drvdata(wdd);
+	int ret = 0;
 
-	return regmap_write(w->map, S5L8720_WDTCON, WDTCON_RUN);
+	mutex_lock(&w->lock);
+	if (!w->suspended)
+		ret = regmap_write(w->map, S5L8720_WDTCON, WDTCON_RUN);
+	mutex_unlock(&w->lock);
+	return ret;
 }
 
 static int s5l8720_wdt_stop(struct watchdog_device *wdd)
 {
 	struct s5l8720_wdt *w = watchdog_get_drvdata(wdd);
+	int ret;
 
-	return regmap_write(w->map, S5L8720_WDTCON, 0);
+	mutex_lock(&w->lock);
+	ret = regmap_write(w->map, S5L8720_WDTCON, 0);
+	mutex_unlock(&w->lock);
+	return ret;
 }
 
 static const struct watchdog_ops s5l8720_wdt_ops = {
@@ -72,11 +86,52 @@ static const struct watchdog_info s5l8720_wdt_info = {
 	.options  = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
 };
 
+/*
+ * Runs after the watchdog core's PM notifier (priority 0) so the hardware
+ * counter stops as soon as the core cancels its ping worker and only restarts
+ * after PM_POST_SUSPEND re-arms the worker.
+ */
+static int s5l8720_wdt_pm_notify(struct notifier_block *nb,
+				 unsigned long mode, void *data)
+{
+	struct s5l8720_wdt *w = container_of(nb, struct s5l8720_wdt, pm_nb);
+	int ret = 0;
+
+	switch (mode) {
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+	case PM_SUSPEND_PREPARE:
+		mutex_lock(&w->lock);
+		w->suspended = true;
+		if (watchdog_active(&w->wdd))
+			ret = regmap_write(w->map, S5L8720_WDTCON, 0);
+		mutex_unlock(&w->lock);
+		break;
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+	case PM_POST_SUSPEND:
+		mutex_lock(&w->lock);
+		w->suspended = false;
+		if (watchdog_active(&w->wdd))
+			ret = regmap_write(w->map, S5L8720_WDTCON, WDTCON_RUN);
+		mutex_unlock(&w->lock);
+		break;
+	}
+
+	return ret ? NOTIFY_BAD : NOTIFY_DONE;
+}
+
+static void s5l8720_wdt_pm_unreg(void *data)
+{
+	unregister_pm_notifier(data);
+}
+
 static int s5l8720_wdt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct s5l8720_wdt *w;
 	u32 rate;
+	int ret;
 
 	if (!dev->parent)
 		return -ENODEV;
@@ -89,6 +144,7 @@ static int s5l8720_wdt_probe(struct platform_device *pdev)
 	if (of_property_read_u32(dev->of_node, "clock-frequency", &rate) || !rate)
 		return dev_err_probe(dev, -EINVAL, "no bus clock rate\n");
 
+	mutex_init(&w->lock);
 	w->wdd.parent = dev;
 	w->wdd.info = &s5l8720_wdt_info;
 	w->wdd.ops = &s5l8720_wdt_ops;
@@ -101,34 +157,23 @@ static int s5l8720_wdt_probe(struct platform_device *pdev)
 	watchdog_set_drvdata(&w->wdd, w);
 	watchdog_init_timeout(&w->wdd, 0, dev);
 	watchdog_stop_on_reboot(&w->wdd);
-	/* the core's own ping must not start the count again once suspend has stopped it */
+	/* PM notifier stops hardware counter right after core stops ping worker and restarts it after PM_POST_SUSPEND */
 	watchdog_stop_ping_on_suspend(&w->wdd);
 	watchdog_stop_on_unregister(&w->wdd);
 	platform_set_drvdata(pdev, w);
 
-	return devm_watchdog_register_device(dev, &w->wdd);
+	ret = devm_watchdog_register_device(dev, &w->wdd);
+	if (ret)
+		return ret;
+
+	w->pm_nb.notifier_call = s5l8720_wdt_pm_notify;
+	w->pm_nb.priority = -1;
+	ret = register_pm_notifier(&w->pm_nb);
+	if (ret)
+		return ret;
+
+	return devm_add_action_or_reset(dev, s5l8720_wdt_pm_unreg, &w->pm_nb);
 }
-
-static int s5l8720_wdt_suspend(struct device *dev)
-{
-	struct s5l8720_wdt *w = dev_get_drvdata(dev);
-
-	if (watchdog_active(&w->wdd))
-		return s5l8720_wdt_stop(&w->wdd);
-	return 0;
-}
-
-static int s5l8720_wdt_resume(struct device *dev)
-{
-	struct s5l8720_wdt *w = dev_get_drvdata(dev);
-
-	if (watchdog_active(&w->wdd))
-		return s5l8720_wdt_ping(&w->wdd);
-	return 0;
-}
-
-static DEFINE_SIMPLE_DEV_PM_OPS(s5l8720_wdt_pm, s5l8720_wdt_suspend,
-				s5l8720_wdt_resume);
 
 static const struct of_device_id s5l8720_wdt_of_match[] = {
 	{ .compatible = "apple,s5l8720-wdt" },
@@ -141,7 +186,6 @@ static struct platform_driver s5l8720_wdt_driver = {
 	.driver	= {
 		.name		= "s5l8720-wdt",
 		.of_match_table	= s5l8720_wdt_of_match,
-		.pm		= pm_sleep_ptr(&s5l8720_wdt_pm),
 	},
 };
 module_platform_driver(s5l8720_wdt_driver);
